@@ -24,6 +24,7 @@ not passed it is unsupported, whatever its version numbers.
 | control-plane filter | Agents reach exactly the five TaskStore methods, each answered by kagent's own server. `MemoryService` and unlisted TaskStore methods are denied. |
 | compiled egress | The governed revision's egress lists the relay and the control-plane filter, and nothing else but the accepted provider default hosts. |
 | timeout chain | The governed `RemoteMCPServer` waits strictly longer than the relay's 20 minutes. |
+| router ingress | Only kagent's controller can reach Substrate's actor router; a pod elsewhere gets no response. |
 | session retirement | Every kagent session Orka created has been deleted. |
 
 The broker's unit tests cover what the cluster cannot inject, including:
@@ -53,6 +54,11 @@ The gate expects the probe fixtures used during verification:
 The gate needs the cluster to itself. It ties each piece of evidence to the
 Task under test by the kagent user, which is unique per Orka session. It fails
 rather than guesses if other sessions call the probe fixtures during a check.
+
+The router-ingress check starts a short-lived curl pod in `OUTSIDER_NS`
+(default `default`), a namespace the router must not admit, and deletes it
+afterwards. That pod must be able to reach `OUTSIDER_CONTROL_URL` (default:
+the control-plane filter), which proves it has networking.
 
 ## Running it
 

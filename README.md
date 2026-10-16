@@ -218,8 +218,43 @@ file contains the broker bearer.
 
 ### Recommended kagent install settings
 
-Run governed agents in a dedicated kagent install:
+Run governed agents in a dedicated kagent install, with these settings. The
+first one applies to observed agents too: without it, Orka does not control
+who can dispatch work to any wrapped Agent.
 
+- Admit only kagent's controller to Substrate's actor router. Each kagent
+  Session is a Substrate actor that the router reaches by a request header,
+  and the agent runtime trusts whoever calls it. Without this, any pod in the
+  cluster can drive an Orka-owned Session directly, bypassing both kagent's
+  gateway and the broker. For example:
+
+  ```yaml
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: atenet-router-ingress
+    namespace: ate-system
+  spec:
+    podSelector:
+      matchLabels:
+        app: atenet-router
+    policyTypes: [Ingress]
+    ingress:
+      - from:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: kagent
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: kagent
+                app.kubernetes.io/component: controller
+  ```
+
+  A NetworkPolicy limits who reaches the router, not which actors they
+  target: anything it admits reaches every actor in that Substrate. So admit
+  only kagent's controller, and don't share the Substrate install with other
+  Substrate clients unless they are equally trusted. Examples are Orka's
+  Substrate workspace provider (`--substrate-router-url`) and google/ax.
 - Allow only the broker to reach the public API.
 - Set `config.runtimeDefaults.controlPlaneUrl` to a proxy that forwards
   exactly the five `kagent.runtime.v1.TaskStoreService` methods: `CreateTask`,

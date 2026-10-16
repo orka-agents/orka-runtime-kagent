@@ -24,10 +24,18 @@ KAGENT_CONTROLLER_CONFIG=${KAGENT_CONTROLLER_CONFIG:-kagent-controller}
 PG_DEPLOY=${PG_DEPLOY:-kagent-postgresql}
 # Provider hosts kagent always allows; accepted in the governance plan.
 PROVIDER_DEFAULT_HOSTS=${PROVIDER_DEFAULT_HOSTS:-https://api.openai.com:443}
+ROUTER_NS=${ROUTER_NS:-ate-system}
+ROUTER_SERVICE=${ROUTER_SERVICE:-atenet-router}
+ROUTER_PORTS=${ROUTER_PORTS:-"http:80 https:443 http:8081 https:8444 http:15020"}   # every port the router Service exposes
+OUTSIDER_NS=${OUTSIDER_NS:-default}     # a namespace the router must not admit
+OUTSIDER_CONTROL_URL=${OUTSIDER_CONTROL_URL:-$CPFILTER_URL}   # any Service that namespace can reach
+CURL_IMAGE=${CURL_IMAGE:-docker.io/curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b}
 LONG=${LONG:-0}                         # 1 also runs the 10-minute approval-expiry check
 RUN=${RUN:-gate-$(date +%s)}
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"; [[ -n ${FORWARD_PID:-} ]] && kill "$FORWARD_PID" 2>/dev/null' EXIT
+OUTSIDER_POD=gate-router-$RUN
+trap 'rm -rf "$WORK"; [[ -n ${FORWARD_PID:-} ]] && kill "$FORWARD_PID" 2>/dev/null
+  kubectl -n "$OUTSIDER_NS" delete pod "$OUTSIDER_POD" --ignore-not-found --wait=false >/dev/null 2>&1' EXIT
 
 failures=0
 skipped=0
@@ -342,6 +350,41 @@ check_timeout_chain() {
   fi
 }
 
+check_router_ingress() {
+  # Each kagent Session is a Substrate actor that the router reaches by a
+  # header, and the runtime trusts its caller, so only kagent's controller may
+  # reach the router. A short-lived pod elsewhere first proves it has
+  # networking, then must get no connection on any router port. The actor it
+  # names does not exist; the gate never addresses a real session.
+  local router="$ROUTER_SERVICE.$ROUTER_NS.svc" actor="$KAGENT_NS/session-00000000-0000-0000-0000-000000000000"
+  local targets="" entry
+  for entry in $ROUTER_PORTS; do targets="$targets ${entry%%:*}://$router:${entry##*:}/"; done
+  # probe prints "<url> <http code> <exit> <TCP connect time>"; a connect time
+  # of zero means no TCP connection was ever made.
+  local script='probe() { printf "%s %s\n" "$1" "$(curl -sk -o /dev/null --connect-timeout 5 --max-time 10 -H "ate-target-actor: $ACTOR" -w "%{http_code} %{exitcode} %{time_connect}" "$1")"; }
+probe "$CONTROL"; for url in $TARGETS; do probe "$url"; done'
+  local output
+  output=$(kubectl -n "$OUTSIDER_NS" run "$OUTSIDER_POD" --image="$CURL_IMAGE" --restart=Never --rm -i --quiet \
+    --pod-running-timeout=2m --env=ACTOR="$actor" --env=CONTROL="$OUTSIDER_CONTROL_URL" --env=TARGETS="$targets" \
+    --command -- sh -c "$script" 2>"$WORK/outsider.log")
+  kubectl -n "$OUTSIDER_NS" delete pod "$OUTSIDER_POD" --ignore-not-found --wait=false >/dev/null 2>&1
+  local control; control=$(printf '%s\n' "$output" | awk -v url="$OUTSIDER_CONTROL_URL" '$1 == url { print $2 }')
+  if [[ ! $control =~ ^[1-5][0-9][0-9]$ ]]; then
+    fail "router ingress" "the $OUTSIDER_NS pod has no working network (control ${OUTSIDER_CONTROL_URL}: ${control:-no result}); $(tr '\n' ' ' < "$WORK/outsider.log")"
+    return
+  fi
+  local reached="" url line
+  for url in $targets; do
+    line=$(printf '%s\n' "$output" | awk -v url="$url" '$1 == url')
+    [[ $line =~ ^[^\ ]+\ 000\ [0-9]+\ 0(\.0+)?$ ]] || reached="$reached [${line:-$url no result}]"
+  done
+  if [[ -z $reached ]]; then
+    pass "a pod in $OUTSIDER_NS gets no connection to Substrate's actor router on any port"
+  else
+    fail "router ingress" "the $OUTSIDER_NS pod reached the router:$reached"
+  fi
+}
+
 check_sessions_retired() {
   # Orka-created sessions belong to per-session users named orka-<40 hex>.
   # Only the terminal state proves deletion; a deletion reason is recorded
@@ -364,6 +407,7 @@ check_relay_rejects_strangers
 check_control_plane_filter
 check_compiled_egress
 check_timeout_chain
+check_router_ingress
 check_sessions_retired
 
 if [[ $failures -gt 0 ]]; then
