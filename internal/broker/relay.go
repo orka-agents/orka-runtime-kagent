@@ -94,8 +94,18 @@ type relayWriter struct {
 
 func guardWrites(w http.ResponseWriter, turn context.Context) (*relayWriter, func()) {
 	guarded := &relayWriter{ResponseWriter: w, control: http.NewResponseController(w)}
-	stop := context.AfterFunc(turn, func() { _ = guarded.control.SetWriteDeadline(time.Now()) })
-	return guarded, func() { stop() }
+	fired := make(chan struct{})
+	stop := context.AfterFunc(turn, func() {
+		defer close(fired)
+		_ = guarded.control.SetWriteDeadline(time.Now())
+	})
+	// A callback that already started must finish before the handler returns:
+	// the ResponseWriter must not be used after that.
+	return guarded, func() {
+		if !stop() {
+			<-fired
+		}
+	}
 }
 
 func (w *relayWriter) WriteHeader(status int) {
@@ -454,22 +464,33 @@ func (b *lifecycleBroker) serveModelRelay(downstream http.ResponseWriter, r *htt
 		w.Header().Set("Content-Type", contentType)
 	}
 	w.WriteHeader(response.StatusCode)
-	usage := relayCopy(w, response.Body, response.StatusCode == http.StatusOK)
+	usage, err := relayCopy(w, response.Body, response.StatusCode == http.StatusOK)
 	turn.addUsage(usage)
+	if err != nil {
+		// The status is already sent. Abort the connection so kagent sees a
+		// failed response instead of a clean but truncated one.
+		panic(http.ErrAbortHandler)
+	}
 }
 
 // relayCopy streams the upstream body and reads usage from each complete
-// JSON chunk or body. It never forwards more than relayMaxResponse bytes.
-func relayCopy(w http.ResponseWriter, body io.Reader, success bool) tokenUsage {
+// JSON chunk or body. It never forwards more than relayMaxResponse bytes, and
+// it reports an oversized or failed upstream body as an error, never as a
+// complete response.
+func relayCopy(w http.ResponseWriter, body io.Reader, success bool) (tokenUsage, error) {
 	flusher, _ := w.(http.Flusher)
-	reader := bufio.NewReaderSize(io.LimitReader(body, relayMaxResponse), 64<<10)
+	reader := bufio.NewReaderSize(io.LimitReader(body, relayMaxResponse+1), 64<<10)
 	var usage tokenUsage
 	var whole bytes.Buffer
+	forwarded := 0
 	for {
 		line, err := reader.ReadSlice('\n')
+		if forwarded += len(line); forwarded > relayMaxResponse {
+			return usage, errRelayResponseTooLarge
+		}
 		if len(line) > 0 {
 			if _, writeErr := w.Write(line); writeErr != nil {
-				return usage
+				return usage, nil // kagent is gone; nothing is left to tell it
 			}
 			if flusher != nil && bytes.HasSuffix(line, []byte("\n")) {
 				flusher.Flush()
@@ -487,8 +508,11 @@ func relayCopy(w http.ResponseWriter, body io.Reader, success bool) tokenUsage {
 		if errors.Is(err, bufio.ErrBufferFull) {
 			continue
 		}
-		if err != nil {
+		if errors.Is(err, io.EOF) {
 			break
+		}
+		if err != nil {
+			return usage, err
 		}
 	}
 	if !usage.reported && success {
@@ -496,7 +520,7 @@ func relayCopy(w http.ResponseWriter, body io.Reader, success bool) tokenUsage {
 			usage = u
 		}
 	}
-	return usage
+	return usage, nil
 }
 
 func chunkUsage(data []byte) (tokenUsage, bool) {
@@ -518,6 +542,8 @@ func chunkUsage(data []byte) (tokenUsage, bool) {
 	}
 	return u, true
 }
+
+var errRelayResponseTooLarge = errors.New("model response exceeds the relay limit")
 
 // canonicalJSON re-encodes a JSON-RPC ID so equal IDs digest equally.
 // Numeric IDs must be integers that fit in int64: decoding them as float64

@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -316,5 +317,45 @@ func TestModelRelayHandlesNullAndInvalidStreamOptions(t *testing.T) {
 	defer g.model.mu.Unlock()
 	if len(g.model.bodies) != 1 || g.model.bodies[0]["stream_options"].(map[string]any)["include_usage"] != true {
 		t.Fatalf("model upstream saw %v", g.model.bodies)
+	}
+}
+
+// failingBody returns its data, then fails as a reset connection would.
+type failingBody struct{ data *strings.Reader }
+
+func (f failingBody) Read(p []byte) (int, error) {
+	if f.data.Len() == 0 {
+		return 0, errors.New("connection reset by peer")
+	}
+	return f.data.Read(p)
+}
+
+// endlessLines is an upstream body that never ends.
+type endlessLines struct{}
+
+func (endlessLines) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+		if i%1024 == 1023 {
+			p[i] = '\n'
+		}
+	}
+	return len(p), nil
+}
+
+func TestRelayCopyReportsTruncatedUpstreamBodies(t *testing.T) {
+	complete := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n"
+	recorder := httptest.NewRecorder()
+	if usage, err := relayCopy(recorder, strings.NewReader(complete), true); err != nil || usage.Input != 4 || recorder.Body.String() != complete {
+		t.Fatalf("complete body: usage %+v, err %v, forwarded %q", usage, err, recorder.Body.String())
+	}
+	partial := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	if _, err := relayCopy(httptest.NewRecorder(), failingBody{strings.NewReader(partial)}, true); err == nil {
+		t.Fatal("an upstream error between complete events looked like a complete response")
+	}
+	recorder = httptest.NewRecorder()
+	if _, err := relayCopy(recorder, endlessLines{}, true); !errors.Is(err, errRelayResponseTooLarge) || recorder.Body.Len() > relayMaxResponse {
+		t.Fatalf("oversized body: err %v after forwarding %d bytes", err, recorder.Body.Len())
 	}
 }
