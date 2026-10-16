@@ -299,7 +299,8 @@ func (h *harness) open() {
 	b, err := newLifecycleBroker(context.Background(), settings{
 		bearer: testBearer, configDigest: h.digest, stateDir: h.dir, model: testModel,
 		expectedRevision: testRevision, userIDPrefix: "orka", operationTimeout: 5 * time.Second,
-		keepalive: 50 * time.Millisecond, now: h.now, log: slog.New(slog.NewJSONHandler(&h.logs, nil)), governed: h.governed,
+		keepalive: 50 * time.Millisecond, cancelGrace: 200 * time.Millisecond, now: h.now,
+		log: slog.New(slog.NewJSONHandler(&h.logs, nil)), governed: h.governed,
 	}, h.remote)
 	if err != nil {
 		h.t.Fatal(err)
@@ -858,7 +859,9 @@ func TestStuckCleanupQuarantinesUntilKagentDeletesTheSession(t *testing.T) {
 	})
 	h := newHarness(t, remote)
 	o, p := testOwner(1), h.prompt("prompt-1")
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		body := turnBody()
 		h.request(context.Background(), responsesPath, h.header(responsesPath, o, p, 1, body), body)
 	}()
@@ -866,6 +869,11 @@ func TestStuckCleanupQuarantinesUntilKagentDeletesTheSession(t *testing.T) {
 	if code, response := h.controlOnce(settlePath, o, p); code != http.StatusConflict || response.SettlementProven {
 		t.Fatalf("stuck task settled: %d %#v", code, response)
 	}
+	<-done
+	eventually(t, "cleanup to find the task", func() bool {
+		h.controlOnce(settlePath, o, p)
+		return remote.count("cancel task-1") > 0
+	})
 	h.advance(defaultCleanupDeadline + time.Second)
 	eventually(t, "quarantine", func() bool {
 		_, response := h.controlOnce(settlePath, o, p)
@@ -1066,5 +1074,36 @@ func TestRetireBootSealsAndRetiresOnlyThatBoot(t *testing.T) {
 	wrong := strings.Replace(string(body("op-3")), identity.LedgerIdentityDigest, config.Digest([]byte("other-ledger")), 1)
 	if code := h.recovery(http.MethodPost, retireBootPath, []byte(wrong)).Code; code != http.StatusBadRequest {
 		t.Fatalf("a different ledger's request = %d", code)
+	}
+}
+
+func TestCancelledTurnLearnsItsTaskAndCancelsItByID(t *testing.T) {
+	remote := newFakeRemote()
+	sent, release := make(chan struct{}), make(chan struct{})
+	remote.streams = append(remote.streams, func(_ context.Context, contextID, messageID string) []item {
+		close(sent)
+		<-release // kagent names the task only after Orka cancels the turn
+		task := &a2atype.Task{ID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking}}
+		remote.setTask(task, messageID)
+		return []item{{event: task}}
+	})
+	h := newHarness(t, remote)
+	o, p := testOwner(1), h.prompt("prompt-1")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.turn(o, p)
+	}()
+	<-sent
+	if code, _ := h.controlOnce(settlePath, o, p); code != http.StatusConflict {
+		t.Fatalf("settle during the send = %d", code)
+	}
+	close(release)
+	<-done
+	if !h.control(settlePath, o, p).SettlementProven {
+		t.Fatal("cancelled turn did not settle")
+	}
+	if remote.count("cancel task-1") == 0 || remote.count("delete ") != 0 {
+		t.Fatalf("settlement did not cancel the named task: %v", remote.snapshotCalls())
 	}
 }

@@ -28,6 +28,10 @@ const (
 	notAcceptedLimit = 30 * time.Second
 	terminalPoll     = 500 * time.Millisecond
 	waitingCancelMax = 30 * time.Second
+	// A cancelled turn keeps its send open this long so kagent can name the
+	// task it admitted; settlement then cancels that task by ID instead of
+	// waiting out an ambiguous dispatch.
+	cancelAdmissionGrace = 10 * time.Second
 )
 
 var toolNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
@@ -159,8 +163,20 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 	tools := newToolRelay(stream)
 	var taskID a2atype.TaskID
 	var state a2atype.TaskState
+	streamCtx, stopStream := context.WithCancel(b.ctx)
+	defer stopStream()
+	stopGrace := context.AfterFunc(ctx, func() { time.AfterFunc(b.cfg.cancelGrace, stopStream) })
+	defer stopGrace()
 	deadline := b.cfg.now().Add(notAcceptedLimit)
 	for {
+		if ctx.Err() != nil {
+			// Cancelled before this attempt was sent: nothing new reached kagent.
+			if taskID == "" {
+				out.invocation.State = invocationRejected
+			}
+			out.failure = failUnknown
+			return out
+		}
 		// kagent starts its dispatch fence when it accepts each attempt, so
 		// the fence is measured from a timestamp persisted just before it.
 		if b.stampAttempt(key, promptKey, sequence) != nil {
@@ -168,7 +184,7 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 			return out
 		}
 		notAccepted := false
-		for event, err := range b.remote.Stream(ctx, s.UserID, s.RemoteID, messageID, text, authorization) {
+		for event, err := range b.remote.Stream(streamCtx, s.UserID, s.RemoteID, messageID, text, authorization) {
 			if err != nil {
 				notAccepted = taskID == "" && kagent.NotAccepted(err)
 				break
@@ -187,7 +203,8 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 			case *a2atype.Task:
 				state = e.Status.State
 			}
-			if state.Terminal() || waiting(state) {
+			// Once a cancelled turn knows its task, settlement takes over.
+			if state.Terminal() || waiting(state) || (taskID != "" && ctx.Err() != nil) {
 				break
 			}
 		}

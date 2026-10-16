@@ -62,6 +62,7 @@ type settings struct {
 	keepalive        time.Duration
 	cleanupDeadline  time.Duration
 	retiredRetention time.Duration
+	cancelGrace      time.Duration
 	now              func() time.Time
 	log              *slog.Logger
 	// governed is set when Orka executes the Agent's tools and serves its model.
@@ -115,6 +116,9 @@ func newLifecycleBroker(ctx context.Context, cfg settings, r remote) (*lifecycle
 	}
 	if cfg.retiredRetention <= 0 {
 		cfg.retiredRetention = defaultRetiredRetention
+	}
+	if cfg.cancelGrace <= 0 {
+		cfg.cancelGrace = cancelAdmissionGrace
 	}
 	if cfg.now == nil {
 		cfg.now = time.Now
