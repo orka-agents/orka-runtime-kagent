@@ -355,21 +355,39 @@ check_router_ingress() {
   # reach the router. A short-lived pod elsewhere first proves it has
   # networking, then must get no connection on any router port. The actor it
   # names does not exist; the gate never addresses a real session.
-  local router="$ROUTER_SERVICE.$ROUTER_NS.svc" actor="$KAGENT_NS/session-00000000-0000-0000-0000-000000000000"
-  # Probe the router Service as it exists, so a misnamed Service or a router
-  # that is not running cannot pass as isolation.
-  local ports ready
+  local actor="$KAGENT_NS/session-00000000-0000-0000-0000-000000000000"
+  # Probe the router Service as it exists, by cluster IP so no name has to
+  # resolve, so that a misnamed Service or a router that is not running
+  # cannot pass as isolation.
+  local ports ready address
   ports=$(kubectl -n "$ROUTER_NS" get service "$ROUTER_SERVICE" -o jsonpath='{.spec.ports[*].port}' 2>/dev/null)
+  address=$(kubectl -n "$ROUTER_NS" get service "$ROUTER_SERVICE" -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
   ready=$(kubectl -n "$ROUTER_NS" get endpointslices -l "kubernetes.io/service-name=$ROUTER_SERVICE" \
     -o jsonpath='{range .items[*].endpoints[?(@.conditions.ready==true)]}{.addresses[0]} {end}' 2>/dev/null)
-  if [[ -z $ports || -z $ready ]]; then
-    fail "router ingress" "Service $ROUTER_NS/$ROUTER_SERVICE has no ports or no ready router (ports: ${ports:-none}; ready: ${ready:-none})"
+  if [[ -z $ports || -z $ready || ! $address =~ ^[0-9a-f.:]+$ ]]; then
+    fail "router ingress" "Service $ROUTER_NS/$ROUTER_SERVICE has no ports, cluster IP, or ready router (ports: ${ports:-none}; IP: ${address:-none}; ready: ${ready:-none})"
     return
   fi
-  local targets="" port
+  # Confirm a listener on every port through kubectl port-forward, which enters
+  # the router pod directly and so bypasses NetworkPolicy. An outsider's refused
+  # connection then means the policy refused it, not that nothing listens.
+  local silent="" port
+  for port in $ports; do
+    if ! forward "$ROUTER_NS" "svc/$ROUTER_SERVICE" "$port"; then silent="$silent $port"; continue; fi
+    curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$FORWARD_PORT/" >/dev/null 2>&1
+    sleep 0.5
+    if ! kill -0 "$FORWARD_PID" 2>/dev/null || grep -qiE 'error (occurred )?forwarding' "$WORK/forward.log"; then silent="$silent $port"; fi
+    stop_forward
+  done
+  if [[ -n $silent ]]; then
+    fail "router ingress" "nothing listens on router Service port(s):$silent"
+    return
+  fi
+  [[ $address == *:* ]] && address="[$address]"
+  local targets=""
   # Plain http on every port: isolation means no TCP connection at all, so
   # the scheme a listener expects does not matter.
-  for port in $ports; do targets="$targets http://$router:$port/"; done
+  for port in $ports; do targets="$targets http://$address:$port/"; done
   # probe prints "<url> <http code> <curl exit> <TCP connect time>"; a connect
   # time of zero means no TCP connection was ever made.
   local script='probe() { printf "%s %s\n" "$1" "$(curl -sk -o /dev/null --connect-timeout 5 --max-time 10 -H "ate-target-actor: $ACTOR" -w "%{http_code} %{exitcode} %{time_connect}" "$1")"; }

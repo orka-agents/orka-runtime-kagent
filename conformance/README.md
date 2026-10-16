@@ -58,7 +58,10 @@ rather than guesses if other sessions call the probe fixtures during a check.
 The router-ingress check starts a short-lived curl pod in `OUTSIDER_NS`
 (default `default`), a namespace the router must not admit, and deletes it
 afterwards. That pod must be able to reach `OUTSIDER_CONTROL_URL` (default:
-the control-plane filter), which proves it has networking.
+the control-plane filter), which proves it has networking. The check first
+confirms through `kubectl port-forward` that the router listens on every
+Service port, then probes the Service's cluster IP so that no name has to
+resolve.
 
 ## Running it
 
