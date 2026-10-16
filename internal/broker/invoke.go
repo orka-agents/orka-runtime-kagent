@@ -1,0 +1,628 @@
+package broker
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/google/uuid"
+	apia2a "github.com/kagent-dev/kagent/go/api/a2a"
+
+	"github.com/orka-agents/orka-runtime-kagent/internal/config"
+	"github.com/orka-agents/orka-runtime-kagent/internal/kagent"
+	"github.com/orka-agents/orka-runtime-kagent/internal/strictjson"
+)
+
+const (
+	maxOutputBytes   = 4 << 20
+	textChunkBytes   = 16 << 10
+	maxToolEvents    = 256
+	notAcceptedRetry = 100 * time.Millisecond
+	notAcceptedLimit = 30 * time.Second
+	terminalPoll     = 500 * time.Millisecond
+	waitingCancelMax = 30 * time.Second
+)
+
+var toolNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
+
+// responseRequest is the only request shape the kagent child sends.
+type responseRequest struct {
+	Model  string `json:"model"`
+	Input  string `json:"input"`
+	Stream bool   `json:"stream"`
+	Store  bool   `json:"store"`
+}
+
+// Failure codes are fixed strings; kagent error text is never relayed.
+const (
+	failTurn          = "kagent_turn_failed"
+	failInputRequired = "kagent_input_required"
+	failUnknown       = "kagent_outcome_unknown"
+	failRevision      = "kagent_revision_mismatch"
+	failSessionGone   = "kagent_session_gone"
+)
+
+func (b *lifecycleBroker) serveResponses(w http.ResponseWriter, r *http.Request, c brokerContext, raw []byte) {
+	var request responseRequest
+	if strictjson.Decode(raw, &request, true) != nil || request.Model != b.cfg.model || !request.Stream || !request.Store ||
+		request.Input == "" || !utf8.ValidString(request.Input) {
+		writeError(w, errInvalid)
+		return
+	}
+	key, promptKey := config.JSONDigest(c.Owner), c.promptKey()
+	runCtx, cancel := context.WithCancel(b.ctx)
+	defer cancel()
+	if err := b.reserve(c, cancel); err != nil {
+		writeError(w, err)
+		return
+	}
+	defer b.wg.Done()
+	stopDisconnect := context.AfterFunc(r.Context(), func() { b.closePrompt(key, promptKey); cancel() })
+	defer stopDisconnect()
+
+	s, err := b.ensureRemote(runCtx, key)
+	if err != nil {
+		b.finish(key, promptKey, c.InvocationSequence, nil)
+		switch {
+		case errors.Is(err, errConflict):
+			writeFailedJSON(w, failRevision)
+		case errors.Is(err, errGone):
+			writeFailedJSON(w, failSessionGone)
+		default:
+			writeError(w, err)
+		}
+		return
+	}
+	messageID := "orka-" + config.JSONDigest(struct {
+		Owner, Prompt string
+		Sequence      uint64
+	}{key, promptKey, c.InvocationSequence})[len("sha256:"):][:48]
+	if err := b.markIntent(key, promptKey, c.InvocationSequence, messageID); err != nil {
+		b.finish(key, promptKey, c.InvocationSequence, nil)
+		writeError(w, err)
+		return
+	}
+
+	stream := newSSE(w)
+	responseID := "kr_" + uuid.NewString()
+	if stream.event("response.created", map[string]any{"type": "response.created", "response": map[string]string{"id": responseID, "status": "in_progress"}}) != nil {
+		b.finish(key, promptKey, c.InvocationSequence, nil)
+		return
+	}
+	stopKeepalive := stream.keepalive(runCtx, b.cfg.keepalive)
+	outcome := b.runTurn(runCtx, s, key, promptKey, c.InvocationSequence, messageID, request.Input, stream)
+	stopKeepalive()
+	b.finish(key, promptKey, c.InvocationSequence, &outcome.invocation)
+	if outcome.failure != "" {
+		_ = stream.event("response.failed", map[string]any{"type": "response.failed", "response": map[string]any{
+			"id": responseID, "status": "failed", "error": map[string]string{"code": outcome.failure, "message": failureMessage(outcome.failure)},
+		}})
+		return
+	}
+	for text := outcome.text; text != ""; {
+		n := min(len(text), textChunkBytes)
+		for n < len(text) && !utf8.RuneStart(text[n]) {
+			n--
+		}
+		if stream.event("response.output_text.delta", map[string]string{"type": "response.output_text.delta", "delta": text[:n]}) != nil {
+			return
+		}
+		text = text[n:]
+	}
+	_ = stream.event("response.completed", map[string]any{"type": "response.completed", "response": map[string]string{"id": responseID, "status": "completed"}})
+}
+
+type turnOutcome struct {
+	invocation invocation
+	text       string
+	failure    string
+}
+
+// runTurn sends the message once (retrying only kagent's explicit
+// not-accepted proof), relays tool activity, and resolves a terminal task.
+func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKey string, sequence uint64, messageID, text string, stream *sse) turnOutcome {
+	out := turnOutcome{invocation: invocation{State: invocationIntent, MessageID: messageID}}
+	tools := newToolRelay(stream)
+	var taskID a2atype.TaskID
+	var state a2atype.TaskState
+	deadline := b.cfg.now().Add(notAcceptedLimit)
+	for {
+		// kagent starts its dispatch fence when it accepts each attempt, so
+		// the fence is measured from a timestamp persisted just before it.
+		if b.stampAttempt(key, promptKey, sequence) != nil {
+			out.failure = failUnknown
+			return out
+		}
+		notAccepted := false
+		for event, err := range b.remote.Stream(ctx, s.UserID, s.RemoteID, messageID, text) {
+			if err != nil {
+				notAccepted = taskID == "" && kagent.NotAccepted(err)
+				break
+			}
+			if id := event.TaskInfo().TaskID; id != "" && taskID == "" {
+				taskID = id
+				b.markAccepted(key, promptKey, sequence, string(id))
+			}
+			switch e := event.(type) {
+			case *a2atype.TaskArtifactUpdateEvent:
+				if e.Artifact != nil {
+					tools.relay(e.Artifact.Parts)
+				}
+			case *a2atype.TaskStatusUpdateEvent:
+				state = e.Status.State
+			case *a2atype.Task:
+				state = e.Status.State
+			}
+			if state.Terminal() || waiting(state) {
+				break
+			}
+		}
+		if notAccepted && b.cfg.now().Before(deadline) && sleepCtx(ctx, notAcceptedRetry) {
+			continue
+		}
+		if notAccepted {
+			out.invocation.State = invocationRejected
+			out.failure = failTurn
+			return out
+		}
+		break
+	}
+	if taskID == "" {
+		// The send outcome is unknown. Keep intent; reconciliation proves it.
+		out.failure = failUnknown
+		return out
+	}
+	out.invocation.State, out.invocation.TaskID = invocationAccepted, string(taskID)
+	if waiting(state) {
+		// Wrapped agents cannot answer kagent approval or input requests.
+		cancelCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), waitingCancelMax)
+		defer stop()
+		if task, err := b.remote.CancelTask(cancelCtx, s.UserID, taskID); err == nil && task != nil && task.Status.State.Terminal() {
+			out.invocation.State, out.invocation.Terminal = invocationCompleted, string(task.Status.State)
+		}
+		out.failure = failInputRequired
+		return out
+	}
+	task, err := b.awaitTerminal(ctx, s.UserID, taskID)
+	if err != nil {
+		out.failure = failUnknown
+		return out
+	}
+	out.invocation.State, out.invocation.Terminal = invocationCompleted, string(task.Status.State)
+	if task.Status.State != a2atype.TaskStateCompleted {
+		out.failure = failTurn
+		return out
+	}
+	text, ok := taskText(task)
+	if !ok {
+		out.failure = failTurn
+		return out
+	}
+	out.text = text
+	return out
+}
+
+func waiting(state a2atype.TaskState) bool {
+	return state == a2atype.TaskStateInputRequired || state == a2atype.TaskStateAuthRequired
+}
+
+// awaitTerminal reads committed task state until it is terminal. Gateway
+// stream completion is observed, not trusted, before reading the result.
+func (b *lifecycleBroker) awaitTerminal(ctx context.Context, userID string, taskID a2atype.TaskID) (*a2atype.Task, error) {
+	for {
+		task, err := b.remote.GetTask(ctx, userID, taskID)
+		if err == nil && task != nil && task.Status.State.Terminal() {
+			return task, nil
+		}
+		if err == nil && task != nil && waiting(task.Status.State) {
+			return nil, errRemote
+		}
+		if !sleepCtx(ctx, terminalPoll) {
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// taskText joins the task's text artifacts, skipping tool activity.
+func taskText(task *a2atype.Task) (string, bool) {
+	var builder strings.Builder
+	for _, artifact := range task.Artifacts {
+		if artifact == nil {
+			continue
+		}
+		var run strings.Builder
+		for _, part := range artifact.Parts {
+			if _, tool := apia2a.ParseToolActivity(part); tool || part == nil {
+				continue
+			}
+			run.WriteString(part.Text())
+		}
+		if run.Len() == 0 {
+			continue
+		}
+		if builder.Len() > 0 && !strings.HasSuffix(builder.String(), "\n") {
+			builder.WriteString("\n")
+		}
+		builder.WriteString(run.String())
+		if builder.Len() > maxOutputBytes {
+			return "", false
+		}
+	}
+	return builder.String(), utf8.ValidString(builder.String())
+}
+
+func failureMessage(code string) string {
+	switch code {
+	case failInputRequired:
+		return "The kagent agent paused for human input; wrapped agents cannot answer kagent approval or input requests."
+	case failUnknown:
+		return "The kagent turn outcome could not be confirmed; cleanup will resolve it."
+	case failRevision:
+		return "The kagent Agent revision does not match the approved revision."
+	case failSessionGone:
+		return "The kagent session was deleted or expired; this Orka session cannot continue."
+	default:
+		return "The kagent turn did not complete."
+	}
+}
+
+func writeFailedJSON(w http.ResponseWriter, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// reserve admits exactly one invocation for a prompt's first round.
+func (b *lifecycleBroker) reserve(c brokerContext, cancel context.CancelFunc) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.storageError != nil {
+		return b.storageError
+	}
+	if b.ctx.Err() != nil {
+		return errClosed
+	}
+	key := config.JSONDigest(c.Owner)
+	if _, running := b.active[key]; running {
+		return errConflict
+	}
+	now := b.cfg.now()
+	err := b.commitLocked(true, func(next *ledger) error {
+		s, err := b.ensureSession(next, c)
+		if err != nil {
+			return err
+		}
+		if s.Retiring || s.Retired {
+			return errClosed
+		}
+		duplicate, err := recordOperation(s, responsesPath, c)
+		if err != nil {
+			return err
+		}
+		if duplicate {
+			return errConflict // No response replay and no inference retry.
+		}
+		p, err := ensurePrompt(s, c)
+		if err != nil {
+			return err
+		}
+		if p.Closing || p.Settled || !p.LeaseExpiresAt.After(now) {
+			return errClosed
+		}
+		expires, _ := time.Parse(time.RFC3339Nano, c.LeaseExpiresAt)
+		if c.LeaseGeneration != p.LeaseGeneration || !expires.Equal(p.LeaseExpiresAt) || c.InvocationSequence <= p.LastSequence || p.LastSequence != 0 {
+			// The kagent child sends one request per prompt.
+			return errConflict
+		}
+		p.LastSequence = c.InvocationSequence
+		p.Invocations[c.InvocationSequence] = &invocation{Sequence: c.InvocationSequence, OperationID: c.OperationID,
+			BodyDigest: c.BodySHA256, State: invocationReserved}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	b.active[key] = active{prompt: c.promptKey(), cancel: cancel}
+	b.wg.Add(1)
+	return nil
+}
+
+// ensureRemote creates (or recovers) the owner's kagent session, then checks
+// it before every dispatch: kagent pins a session's revision at creation, but
+// idle expiry or an operator can delete the session at any time.
+func (b *lifecycleBroker) ensureRemote(ctx context.Context, key string) (*session, error) {
+	b.mu.Lock()
+	s := b.ledger.Sessions[key]
+	if s == nil {
+		b.mu.Unlock()
+		return nil, errPending
+	}
+	userID, requestID, remoteID, state := s.UserID, s.RequestID, s.RemoteID, s.CreateState
+	if s.RemoteGone {
+		b.mu.Unlock()
+		return nil, errGone
+	}
+	if state == createNone {
+		if err := b.commitLocked(false, func(next *ledger) error {
+			next.Sessions[key].CreateState = createIntent
+			return nil
+		}); err != nil {
+			b.mu.Unlock()
+			return nil, err
+		}
+		state = createIntent
+	}
+	b.mu.Unlock()
+	var observed kagent.Session
+	var err error
+	switch state {
+	case createIntent:
+		observed, err = b.remote.CreateSession(ctx, userID, requestID)
+	case createKnown:
+		observed, err = b.remote.GetSession(ctx, userID, remoteID)
+	default:
+		return nil, errRemote
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	unchanged := errors.New("unchanged")
+	commitErr := b.commitLocked(false, func(next *ledger) error {
+		current := next.Sessions[key]
+		if current.CreateState != state || current.RemoteID != remoteID {
+			return unchanged
+		}
+		switch {
+		case err == nil:
+		case state == createIntent && errors.Is(err, kagent.ErrRejected):
+			current.CreateState = createNone
+			return nil
+		case state == createKnown && errors.Is(err, kagent.ErrNotFound):
+			current.RemoteGone = true
+			return nil
+		default:
+			return unchanged
+		}
+		gone, mismatch := observed.Deleting, observed.Revision != b.cfg.expectedRevision
+		if state == createIntent {
+			current.CreateState, current.RemoteID, current.Revision = createKnown, observed.ID, observed.Revision
+		} else if !gone && !mismatch {
+			return unchanged
+		}
+		current.RemoteGone = current.RemoteGone || gone
+		current.RevisionMismatch = current.RevisionMismatch || mismatch
+		return nil
+	})
+	if commitErr != nil && !errors.Is(commitErr, unchanged) {
+		return nil, commitErr
+	}
+	current := b.ledger.Sessions[key]
+	switch {
+	case current.RemoteGone:
+		return nil, errGone
+	case current.RevisionMismatch:
+		return nil, errConflict
+	case err != nil || current.CreateState != createKnown:
+		return nil, errRemote
+	}
+	copy := *current
+	return &copy, nil
+}
+
+func (b *lifecycleBroker) markIntent(key, promptKey string, sequence uint64, messageID string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.cfg.now()
+	return b.commitLocked(false, func(next *ledger) error {
+		inv := invocationFor(next, key, promptKey, sequence)
+		if inv == nil || inv.State != invocationReserved {
+			return errPending
+		}
+		inv.State, inv.MessageID, inv.SentAt = invocationIntent, messageID, now
+		return nil
+	})
+}
+
+// stampAttempt records the start of a send attempt as the dispatch fence base.
+func (b *lifecycleBroker) stampAttempt(key, promptKey string, sequence uint64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.cfg.now()
+	return b.commitLocked(false, func(next *ledger) error {
+		inv := invocationFor(next, key, promptKey, sequence)
+		if inv == nil || inv.State != invocationIntent {
+			return errPending
+		}
+		inv.SentAt = now
+		return nil
+	})
+}
+
+func (b *lifecycleBroker) markAccepted(key, promptKey string, sequence uint64, taskID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_ = b.commitLocked(false, func(next *ledger) error {
+		inv := invocationFor(next, key, promptKey, sequence)
+		if inv == nil || inv.State != invocationIntent {
+			return nil
+		}
+		inv.State, inv.TaskID = invocationAccepted, taskID
+		return nil
+	})
+}
+
+// finish records the request's final knowledge and releases ownership. A nil
+// result leaves the durable invocation as it is.
+func (b *lifecycleBroker) finish(key, promptKey string, sequence uint64, result *invocation) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if result != nil {
+		_ = b.commitLocked(false, func(next *ledger) error {
+			inv := invocationFor(next, key, promptKey, sequence)
+			if inv == nil {
+				return nil
+			}
+			switch result.State {
+			case invocationCompleted:
+				inv.State, inv.TaskID, inv.Terminal = invocationCompleted, result.TaskID, result.Terminal
+			case invocationAccepted:
+				inv.State, inv.TaskID = invocationAccepted, result.TaskID
+			case invocationRejected:
+				if inv.State == invocationIntent {
+					inv.State = invocationRejected
+				}
+			}
+			return nil
+		})
+	}
+	delete(b.active, key)
+}
+
+func (b *lifecycleBroker) closePrompt(key, promptKey string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_ = b.commitLocked(false, func(next *ledger) error {
+		if s := next.Sessions[key]; s != nil {
+			if p := s.Prompts[promptKey]; p != nil {
+				p.Closing = true
+			}
+		}
+		return nil
+	})
+}
+
+func invocationFor(l *ledger, key, promptKey string, sequence uint64) *invocation {
+	s := l.Sessions[key]
+	if s == nil {
+		return nil
+	}
+	p := s.Prompts[promptKey]
+	if p == nil {
+		return nil
+	}
+	return p.Invocations[sequence]
+}
+
+// toolRelay emits observed kagent tool activity: names and status only.
+type toolRelay struct {
+	stream *sse
+	ids    map[string]string
+}
+
+func newToolRelay(stream *sse) *toolRelay {
+	return &toolRelay{stream: stream, ids: map[string]string{}}
+}
+
+func (t *toolRelay) relay(parts []*a2atype.Part) {
+	for _, part := range parts {
+		activity, ok := apia2a.ParseToolActivity(part)
+		if !ok {
+			continue
+		}
+		name := activity.Name
+		if !toolNamePattern.MatchString(name) {
+			name = "tool"
+		}
+		id, seen := t.ids[activity.ID]
+		switch activity.Kind {
+		case apia2a.ToolCallKind:
+			if seen || len(t.ids) >= maxToolEvents {
+				continue
+			}
+			id = "kt_" + uuid.NewString()
+			t.ids[activity.ID] = id
+			_ = t.stream.event("response.kagent_tool.started", map[string]any{"type": "response.kagent_tool.started", "tool": map[string]string{"id": id, "name": name}})
+		case apia2a.ToolResultKind:
+			if !seen {
+				continue
+			}
+			_ = t.stream.event("response.kagent_tool.finished", map[string]any{"type": "response.kagent_tool.finished", "tool": map[string]string{"id": id, "name": name, "status": "completed"}})
+		}
+	}
+}
+
+// sse serializes server-sent events and keepalive comments.
+type sse struct {
+	mu      sync.Mutex
+	w       http.ResponseWriter
+	flusher http.Flusher
+	started bool
+	failed  bool
+}
+
+func newSSE(w http.ResponseWriter) *sse {
+	flusher, _ := w.(http.Flusher)
+	return &sse{w: w, flusher: flusher}
+}
+
+func (s *sse) start() {
+	if s.started {
+		return
+	}
+	s.started = true
+	s.w.Header().Set("Content-Type", "text/event-stream")
+	s.w.WriteHeader(http.StatusOK)
+}
+
+func (s *sse) write(frame []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failed {
+		return errClosed
+	}
+	s.start()
+	if _, err := s.w.Write(frame); err != nil {
+		s.failed = true
+		return err
+	}
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+	return nil
+}
+
+func (s *sse) event(name string, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return s.write([]byte("event: " + name + "\ndata: " + string(data) + "\n\n"))
+}
+
+func (s *sse) keepalive(ctx context.Context, every time.Duration) func() {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if s.write([]byte(": keepalive\n\n")) != nil {
+					return
+				}
+			}
+		}
+	}()
+	return func() { cancel(); <-done }
+}

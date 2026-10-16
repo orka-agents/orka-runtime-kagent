@@ -1,0 +1,8 @@
+This repository adapts an Orka harness v2 lifecycle-broker adapter for kagent.
+
+internal/strictjson and internal/durablestore are copied from
+https://github.com/orka-agents/agent-runtime-foundry under the MIT License
+(LICENSES/agent-runtime-foundry.txt). The ACP child framing in internal/acp is
+derived from the same repository. The broker protocol is Orka's lifecycle
+broker protocol (orka.foundry.broker.v1); the kagent-facing lifecycle is a new
+implementation of kagent's public Sessions and A2A APIs.

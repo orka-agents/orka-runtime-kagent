@@ -1,0 +1,9 @@
+{
+  "model": "kagent/kagent/probe",
+  "kagent": {
+    "controlPlaneURL": "http://kagent-controller.kagent.svc:8083",
+    "agent": {"namespace": "kagent", "name": "probe"},
+    "expectedRevision": "c85fb79c49c56d3720b2744f8e330d1cbe5f18fe84ad407f060043677716806f",
+    "userIDPrefix": "orka"
+  }
+}
