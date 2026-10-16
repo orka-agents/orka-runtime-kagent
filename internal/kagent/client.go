@@ -30,8 +30,10 @@ const (
 	userIDHeader       = "x-user-id"
 	maxMessageBytes    = 16 << 20
 	defaultCallTimeout = 30 * time.Second
-	listPageSize       = 100
-	maxListPages       = 50
+	// Task pages carry each task's history. Small pages keep a page of long
+	// histories under maxMessageBytes; together they still cover 5000 tasks.
+	listPageSize = 20
+	maxListPages = 250
 )
 
 var (
@@ -112,7 +114,9 @@ func (c *Client) CreateSession(ctx context.Context, userID, requestID string) (S
 		return Session{}, errors.Join(ErrRejected, err)
 	}
 	if err != nil {
-		return Session{}, classifyRPC(err)
+		// Any other refusal can follow an earlier attempt that kagent
+		// committed but whose response was lost, so it proves nothing.
+		return Session{}, err
 	}
 	return c.sessionFrom(response.GetSession())
 }
@@ -252,7 +256,7 @@ func (c *Client) FindTaskByMessage(ctx context.Context, userID, contextID, messa
 	pageToken, unfinished := "", false
 	for range maxListPages {
 		response, err := client.ListTasks(ctx, &a2atype.ListTasksRequest{
-			ContextID: contextID, PageSize: listPageSize, PageToken: pageToken, IncludeArtifacts: true,
+			ContextID: contextID, PageSize: listPageSize, PageToken: pageToken,
 		})
 		if err != nil {
 			return nil, classifyA2A(err)
