@@ -26,7 +26,6 @@ PG_DEPLOY=${PG_DEPLOY:-kagent-postgresql}
 PROVIDER_DEFAULT_HOSTS=${PROVIDER_DEFAULT_HOSTS:-https://api.openai.com:443}
 ROUTER_NS=${ROUTER_NS:-ate-system}
 ROUTER_SERVICE=${ROUTER_SERVICE:-atenet-router}
-ROUTER_PORTS=${ROUTER_PORTS:-"http:80 https:443 http:8081 https:8444 http:15020"}   # every port the router Service exposes
 OUTSIDER_NS=${OUTSIDER_NS:-default}     # a namespace the router must not admit
 OUTSIDER_CONTROL_URL=${OUTSIDER_CONTROL_URL:-$CPFILTER_URL}   # any Service that namespace can reach
 CURL_IMAGE=${CURL_IMAGE:-docker.io/curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b}
@@ -357,10 +356,22 @@ check_router_ingress() {
   # networking, then must get no connection on any router port. The actor it
   # names does not exist; the gate never addresses a real session.
   local router="$ROUTER_SERVICE.$ROUTER_NS.svc" actor="$KAGENT_NS/session-00000000-0000-0000-0000-000000000000"
-  local targets="" entry
-  for entry in $ROUTER_PORTS; do targets="$targets ${entry%%:*}://$router:${entry##*:}/"; done
-  # probe prints "<url> <http code> <exit> <TCP connect time>"; a connect time
-  # of zero means no TCP connection was ever made.
+  # Probe the router Service as it exists, so a misnamed Service or a router
+  # that is not running cannot pass as isolation.
+  local ports ready
+  ports=$(kubectl -n "$ROUTER_NS" get service "$ROUTER_SERVICE" -o jsonpath='{.spec.ports[*].port}' 2>/dev/null)
+  ready=$(kubectl -n "$ROUTER_NS" get endpointslices -l "kubernetes.io/service-name=$ROUTER_SERVICE" \
+    -o jsonpath='{range .items[*].endpoints[?(@.conditions.ready==true)]}{.addresses[0]} {end}' 2>/dev/null)
+  if [[ -z $ports || -z $ready ]]; then
+    fail "router ingress" "Service $ROUTER_NS/$ROUTER_SERVICE has no ports or no ready router (ports: ${ports:-none}; ready: ${ready:-none})"
+    return
+  fi
+  local targets="" port
+  # Plain http on every port: isolation means no TCP connection at all, so
+  # the scheme a listener expects does not matter.
+  for port in $ports; do targets="$targets http://$router:$port/"; done
+  # probe prints "<url> <http code> <curl exit> <TCP connect time>"; a connect
+  # time of zero means no TCP connection was ever made.
   local script='probe() { printf "%s %s\n" "$1" "$(curl -sk -o /dev/null --connect-timeout 5 --max-time 10 -H "ate-target-actor: $ACTOR" -w "%{http_code} %{exitcode} %{time_connect}" "$1")"; }
 probe "$CONTROL"; for url in $TARGETS; do probe "$url"; done'
   local output
@@ -375,13 +386,15 @@ probe "$CONTROL"; for url in $TARGETS; do probe "$url"; done'
   fi
   local reached="" url line
   for url in $targets; do
+    # Only a refused (7) or timed-out (28) connection is isolation. Any other
+    # failure, such as a name that did not resolve (6), proves nothing.
     line=$(printf '%s\n' "$output" | awk -v url="$url" '$1 == url')
-    [[ $line =~ ^[^\ ]+\ 000\ [0-9]+\ 0(\.0+)?$ ]] || reached="$reached [${line:-$url no result}]"
+    [[ $line =~ ^[^\ ]+\ 000\ (7|28)\ 0(\.0+)?$ ]] || reached="$reached [${line:-$url no result}]"
   done
   if [[ -z $reached ]]; then
     pass "a pod in $OUTSIDER_NS gets no connection to Substrate's actor router on any port"
   else
-    fail "router ingress" "the $OUTSIDER_NS pod reached the router:$reached"
+    fail "router ingress" "the $OUTSIDER_NS pod reached the router, or the probe proved nothing:$reached"
   fi
 }
 
