@@ -1216,6 +1216,29 @@ func TestV0TurnStreamsToolActivity(t *testing.T) {
 	}
 }
 
+// A v0 session keeps the broker's request ID as its kagent ID, which is not a
+// UUID; the ledger must still reopen with it.
+func TestV0LedgerReopensWithItsSessions(t *testing.T) {
+	remote := newFakeRemote()
+	remote.streams = append(remote.streams, completedStream(remote, "task-1", "ok"))
+	h := newV0Harness(t, remote)
+	o, p := testOwner(1), h.prompt("prompt-1")
+	h.turn(o, p)
+	h.b.mu.Lock()
+	for _, s := range h.b.ledger.Sessions {
+		s.RemoteID = s.RequestID // what the v0 client records
+	}
+	err := h.b.commitLocked(false, func(*ledger) error { return nil })
+	h.b.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.restart()
+	if !h.control(settlePath, o, p).SettlementProven {
+		t.Fatal("a reopened v0 ledger did not settle its prompt")
+	}
+}
+
 func TestV0DeletedSessionNeverProvesSettlement(t *testing.T) {
 	for _, v0 := range []bool{false, true} {
 		remote := newFakeRemote()

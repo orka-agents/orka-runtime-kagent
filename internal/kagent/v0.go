@@ -113,12 +113,11 @@ func (c *V0Client) CreateSession(ctx context.Context, userID, requestID string) 
 	switch {
 	case err != nil:
 		return Session{}, err
-	case status == http.StatusBadRequest || status == http.StatusNotFound:
-		// The controller refuses these before it writes anything: a malformed
-		// request or an Agent it does not know.
-		return Session{}, fmt.Errorf("%w: kagent answered %d", ErrRejected, status)
 	case status != http.StatusCreated && status != http.StatusOK:
-		// Anything else, including the 500 a deleted ID gets, proves nothing.
+		// No refusal proves nothing was created: v0 answers 400 for any
+		// failure to look up the Agent, transient ones included, before it
+		// checks for an existing session, and 500 when the ID was deleted. A
+		// retry may follow an attempt that committed and lost its response.
 		return Session{}, fmt.Errorf("kagent session create answered %d", status)
 	}
 	return c.session(ctx, envelope.Data, requestID, userID)

@@ -131,7 +131,7 @@ func TestV0SessionsAreCreatedReadAndDeletedAsTheUser(t *testing.T) {
 	}
 }
 
-func TestV0CreateRefusalsAreDefiniteOnlyBeforeAWrite(t *testing.T) {
+func TestV0CreateRefusalsAreNeverDefinite(t *testing.T) {
 	client, controller := newV0Test(t)
 	ctx := context.Background()
 	if _, err := client.CreateSession(ctx, "orka-user", "dead"); err == nil || errors.Is(err, ErrRejected) {
@@ -141,8 +141,10 @@ func TestV0CreateRefusalsAreDefiniteOnlyBeforeAWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := other.CreateSession(ctx, "orka-user", "orka-session"); !errors.Is(err, ErrRejected) {
-		t.Fatalf("an unknown Agent was not a definite refusal: %v", err)
+	// v0 answers 400 for any failure to look up the Agent, transient ones
+	// included, so even this refusal is not proof that nothing was created.
+	if _, err := other.CreateSession(ctx, "orka-user", "orka-session"); err == nil || errors.Is(err, ErrRejected) {
+		t.Fatalf("an unknown-Agent refusal was treated as definite: %v", err)
 	}
 	controller.agentID = "kagent__NS__someone_else"
 	if _, err := client.CreateSession(ctx, "orka-user", "orka-session"); err == nil {

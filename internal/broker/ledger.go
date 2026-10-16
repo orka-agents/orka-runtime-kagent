@@ -241,7 +241,9 @@ func sessionValid(s *session, key, digest string) bool {
 			return false
 		}
 	case createKnown, createDeleted:
-		if id, err := uuid.Parse(s.RemoteID); err != nil || id.String() != s.RemoteID {
+		// kagent v1 assigns a UUID; kagent v0 keeps the request ID the broker
+		// creates the session with.
+		if id, err := uuid.Parse(s.RemoteID); (err != nil || id.String() != s.RemoteID) && s.RemoteID != s.RequestID {
 			return false
 		}
 	default:
