@@ -57,8 +57,14 @@ type fakeRemote struct {
 	streams   []func(ctx context.Context, contextID, messageID string) []item
 	calls     []string
 	findErr   error
-	onFind    func() // runs during a task lookup
-	auth      string // the authorization of the latest stream
+	cancelErr error    // CancelTask fails with this, as a timed-out cancel would
+	pods      []string // UIDs of the pods running the Agent (kagent v0)
+	onFind    func()   // runs during a task lookup
+	auth      string   // the authorization of the latest stream
+	// v0 models kagent v0.x: a deleted session's tasks stay readable and
+	// cancellable by ID, because deletion does not stop the Agent, but they can
+	// no longer be listed by session.
+	v0 bool
 }
 
 func (f *fakeRemote) lastAuthorization() string {
@@ -187,7 +193,7 @@ func (f *fakeRemote) GetTask(_ context.Context, _ string, taskID a2atype.TaskID)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	task, ok := f.tasks[taskID]
-	if ok && f.deleted[task.ContextID] {
+	if ok && f.deleted[task.ContextID] && !f.v0 {
 		return nil, errUnauthorized
 	}
 	if !ok {
@@ -208,6 +214,9 @@ func (f *fakeRemote) FindTaskByMessage(_ context.Context, _, contextID, messageI
 		return nil, f.findErr
 	}
 	if f.deleted[contextID] {
+		if f.v0 {
+			return nil, errors.New("get session: not found") // v0 cannot list a deleted session's tasks
+		}
 		return nil, errUnauthorized
 	}
 	id, ok := f.messages[messageID]
@@ -218,12 +227,27 @@ func (f *fakeRemote) FindTaskByMessage(_ context.Context, _, contextID, messageI
 	return &copy, nil
 }
 
+func (f *fakeRemote) AgentPodUIDs(context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.pods...), nil
+}
+
+func (f *fakeRemote) setPods(uids ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pods = uids
+}
+
 func (f *fakeRemote) CancelTask(_ context.Context, _ string, taskID a2atype.TaskID) (*a2atype.Task, error) {
 	f.record("cancel " + string(taskID))
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.cancelErr != nil {
+		return nil, f.cancelErr
+	}
 	task, ok := f.tasks[taskID]
-	if ok && f.deleted[task.ContextID] {
+	if ok && f.deleted[task.ContextID] && !f.v0 {
 		return nil, errUnauthorized
 	}
 	if !ok {
@@ -257,6 +281,8 @@ type harness struct {
 	logs   lockedBuffer
 	// governed, when set, opens the broker in governed mode.
 	governed *governedSettings
+	// kagentV0 opens the broker with kagent v0.x rules.
+	kagentV0 bool
 }
 
 type lockedBuffer struct {
@@ -301,7 +327,7 @@ func (h *harness) open() {
 		bearer: testBearer, configDigest: h.digest, stateDir: h.dir, model: testModel,
 		expectedRevision: testRevision, userIDPrefix: "orka", operationTimeout: 5 * time.Second,
 		keepalive: 50 * time.Millisecond, cancelGrace: 200 * time.Millisecond, now: h.now,
-		log: slog.New(slog.NewJSONHandler(&h.logs, nil)), governed: h.governed,
+		log: slog.New(slog.NewJSONHandler(&h.logs, nil)), governed: h.governed, kagentV0: h.kagentV0,
 	}, h.remote)
 	if err != nil {
 		h.t.Fatal(err)
@@ -1034,6 +1060,145 @@ func TestAbsentTaskIsFencedByDeletionNotTrusted(t *testing.T) {
 	inv = &invocation{State: invocationIntent, MessageID: "orka-message", SentAt: sentAt}
 	if kind, ok := h.b.resolveInvocation(context.Background(), s, inv); !ok || kind != proofSessionDeleted || remote.count("delete ") != 1 {
 		t.Fatalf("after the window = %s %v, calls %v", kind, ok, remote.snapshotCalls())
+	}
+}
+
+func newV0Harness(t *testing.T, remote *fakeRemote) *harness {
+	t.Helper()
+	h := &harness{t: t, remote: remote, dir: filepath.Join(t.TempDir(), "ledger"), digest: config.Digest([]byte("kagent-config")),
+		clock: time.Now().UTC(), kagentV0: true}
+	remote.v0 = true
+	h.open()
+	return h
+}
+
+// newV0Resolver opens a v0 broker and a kagent session for resolving
+// invocations directly.
+func newV0Resolver(t *testing.T, governed bool) (*harness, *fakeRemote, *session) {
+	t.Helper()
+	remote := newFakeRemote()
+	remote.v0 = true
+	h := &harness{t: t, remote: remote, dir: filepath.Join(t.TempDir(), "ledger"), digest: config.Digest([]byte("kagent-config")),
+		clock: time.Now().UTC(), kagentV0: true}
+	if governed {
+		h.governed = &governedSettings{UpstreamBaseURL: "http://model.orka.svc/v1", UpstreamModel: "gpt-test", UpstreamToken: testUpstreamToken}
+	}
+	h.open()
+	userID, requestID := h.b.identity(testOwner(1))
+	remoteSession, _ := remote.CreateSession(context.Background(), userID, requestID)
+	return h, remote, &session{UserID: userID, RemoteID: remoteSession.ID}
+}
+
+// A v0 listing is only a snapshot, and deleting a v0 session does not stop a
+// call already in flight. So an observed send whose task cannot be found
+// settles only once every Agent pod that existed at the deletion is gone.
+func TestV0ObservedAmbiguousSendSettlesOncePodsAreReplaced(t *testing.T) {
+	h, remote, s := newV0Resolver(t, false)
+	remote.setPods("pod-a")
+	inv := &invocation{State: invocationIntent, MessageID: "orka-message", SentAt: h.now().Add(-dispatchFenceWindow - time.Second)}
+	if kind, ok := h.b.resolveInvocation(context.Background(), s, inv); ok || inv.FencedAt.IsZero() || remote.count("delete ") != 1 {
+		t.Fatalf("first pass = %s %v, fenced %v %v, calls %v", kind, ok, inv.FencedAt, inv.FencedPods, remote.snapshotCalls())
+	}
+	h.advance(24 * time.Hour)
+	if kind, ok := h.b.resolveInvocation(context.Background(), s, inv); ok {
+		t.Fatalf("settled while the pod that could run the turn remains: %s", kind)
+	}
+	remote.setPods("pod-a", "pod-b") // a restart in progress: pod-a is terminating
+	if kind, ok := h.b.resolveInvocation(context.Background(), s, inv); ok {
+		t.Fatalf("settled while the old pod terminates: %s", kind)
+	}
+	remote.setPods("pod-b")
+	if kind, ok := h.b.resolveInvocation(context.Background(), s, inv); !ok || kind != proofPodsReplaced {
+		t.Fatalf("after the restart = %s %v", kind, ok)
+	}
+}
+
+// A governed turn's token dies with the turn, so a late execution can reach
+// neither Orka's tools nor its model: deleting the session settles the send.
+func TestV0GovernedAmbiguousSendSettlesOnTheRevokedToken(t *testing.T) {
+	h, remote, s := newV0Resolver(t, true)
+	inv := &invocation{State: invocationIntent, MessageID: "orka-message", SentAt: h.now().Add(-dispatchFenceWindow - time.Second)}
+	if kind, ok := h.b.resolveInvocation(context.Background(), s, inv); !ok || kind != proofTurnTokenRevoked || remote.count("delete ") != 1 {
+		t.Fatalf("governed fence = %s %v, calls %v", kind, ok, remote.snapshotCalls())
+	}
+}
+
+// A session someone else deleted can no longer be listed, so the fence
+// records the pods that exist when the broker sees it gone.
+func TestV0ExternallyDeletedSessionIsFencedOnItsPods(t *testing.T) {
+	h, remote, s := newV0Resolver(t, false)
+	remote.setPods("pod-a")
+	remote.deleteAll()
+	inv := &invocation{State: invocationIntent, MessageID: "orka-message", SentAt: h.now().Add(-dispatchFenceWindow - time.Second)}
+	if kind, ok := h.b.resolveInvocation(context.Background(), s, inv); ok || len(inv.FencedPods) != 1 {
+		t.Fatalf("an externally deleted session = %s %v, fenced pods %v", kind, ok, inv.FencedPods)
+	}
+	remote.setPods("pod-b")
+	if kind, ok := h.b.resolveInvocation(context.Background(), s, inv); !ok || kind != proofPodsReplaced {
+		t.Fatalf("after the restart = %s %v", kind, ok)
+	}
+}
+
+// kagent v0 records a cancellation before its execution has unwound, so a v0
+// task settles only once a cancel call returns, even when it reads terminal.
+func TestV0TaskSettlesOnlyWhenACancelReturns(t *testing.T) {
+	for _, v0 := range []bool{false, true} {
+		remote := newFakeRemote()
+		newBroker := newHarness
+		if v0 {
+			newBroker = newV0Harness
+		}
+		h := newBroker(t, remote)
+		userID, requestID := h.b.identity(testOwner(1))
+		remoteSession, _ := remote.CreateSession(context.Background(), userID, requestID)
+		remote.setTask(&a2atype.Task{ID: "task-1", ContextID: remoteSession.ID, Status: a2atype.TaskStatus{State: a2atype.TaskStateCanceled}}, "orka-message")
+		remote.cancelErr = context.DeadlineExceeded
+		s := &session{UserID: userID, RemoteID: remoteSession.ID}
+		inv := &invocation{State: invocationAccepted, MessageID: "orka-message", TaskID: "task-1"}
+		if kind, ok := h.b.resolveInvocation(context.Background(), s, inv); ok == v0 {
+			t.Fatalf("v0=%v: a canceled row with a failed cancel settled = %v (%s)", v0, ok, kind)
+		}
+		remote.cancelErr = nil
+		if kind, ok := h.b.resolveInvocation(context.Background(), s, inv); !ok || kind != proofTaskTerminal {
+			t.Fatalf("v0=%v: after the cancel returned = %s %v", v0, kind, ok)
+		}
+	}
+}
+
+func TestV0CompletedTurnSettlesThroughACancel(t *testing.T) {
+	remote := newFakeRemote()
+	remote.streams = append(remote.streams, completedStream(remote, "task-1", "ok"))
+	h := newV0Harness(t, remote)
+	o, p := testOwner(1), h.prompt("prompt-1")
+	if recorder := h.turn(o, p); recorder.Code != http.StatusOK {
+		t.Fatalf("turn = %d", recorder.Code)
+	}
+	if !h.control(settlePath, o, p).SettlementProven || remote.count("cancel task-1") == 0 {
+		t.Fatalf("a v0 turn settled without a cancel acknowledgement: %v", remote.snapshotCalls())
+	}
+}
+
+func TestV0DeletedSessionNeverProvesSettlement(t *testing.T) {
+	for _, v0 := range []bool{false, true} {
+		remote := newFakeRemote()
+		newBroker := newHarness
+		if v0 {
+			newBroker = newV0Harness
+		}
+		h := newBroker(t, remote)
+		userID, requestID := h.b.identity(testOwner(1))
+		remoteSession, _ := remote.CreateSession(context.Background(), userID, requestID)
+		remote.setTask(&a2atype.Task{ID: "task-1", ContextID: remoteSession.ID, Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking}}, "orka-message")
+		remote.mu.Lock()
+		remote.stuck["task-1"] = true
+		remote.mu.Unlock()
+		remote.deleteAll()
+		s := &session{UserID: userID, RemoteID: remoteSession.ID}
+		inv := &invocation{State: invocationAccepted, MessageID: "orka-message", TaskID: "task-1"}
+		kind, ok := h.b.resolveInvocation(context.Background(), s, inv)
+		if ok == v0 {
+			t.Fatalf("v0=%v: a deleted session settled = %v (%s)", v0, ok, kind)
+		}
 	}
 }
 

@@ -23,7 +23,9 @@ const (
 	ordinaryLedgerBytes  = 24 << 20
 	maxSessions          = 4096
 	maxPromptsPerSession = 4096
-	maxOperations        = 16384
+	// maxFencedPods bounds the Agent pods a kagent v0 fence records.
+	maxFencedPods = 16
+	maxOperations = 16384
 	// A seal is permanent for the ledger's lifetime. At capacity, retiring
 	// another boot fails closed until the ledger is replaced.
 	maxSealedBoots       = 4096
@@ -116,7 +118,12 @@ type invocation struct {
 	MessageID   string    `json:"messageID,omitempty"`
 	TaskID      string    `json:"taskID,omitempty"`
 	SentAt      time.Time `json:"sentAt,omitzero"`
-	Terminal    string    `json:"terminal,omitempty"`
+	// FencedAt records when the broker confirmed a kagent v0 session deleted
+	// to fence an ambiguous send, and FencedPods the Agent pods that existed
+	// then. An observed send settles once none of those pods is left.
+	FencedAt   time.Time `json:"fencedAt,omitzero"`
+	FencedPods []string  `json:"fencedPods,omitempty"`
+	Terminal   string    `json:"terminal,omitempty"`
 }
 
 type store struct {
@@ -295,8 +302,15 @@ func promptValid(p *prompt, key, digest string, s *session) bool {
 
 func invocationValid(inv *invocation, sequence uint64, p *prompt, s *session) bool {
 	if inv == nil || inv.Sequence != sequence || sequence == 0 || !config.DigestValid(inv.BodyDigest) ||
-		!config.SafeString(inv.OperationID, 512) || s.Operations[inv.OperationID] == "" {
+		!config.SafeString(inv.OperationID, 512) || s.Operations[inv.OperationID] == "" ||
+		(!inv.FencedAt.IsZero() && inv.State != invocationIntent && inv.State != invocationSettled) ||
+		(inv.FencedAt.IsZero() && len(inv.FencedPods) != 0) || len(inv.FencedPods) > maxFencedPods {
 		return false
+	}
+	for _, uid := range inv.FencedPods {
+		if !config.SafeString(uid, 64) {
+			return false
+		}
 	}
 	switch inv.State {
 	case invocationReserved:

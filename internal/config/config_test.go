@@ -79,3 +79,31 @@ func TestDecodeAcceptsGovernedUpstream(t *testing.T) {
 		t.Fatalf("upstream base = %q %v", base, err)
 	}
 }
+
+func TestDecodePinsEachKagentVersionItsOwnWay(t *testing.T) {
+	v1Revision := "c85fb79c49c56d3720b2744f8e330d1cbe5f18fe84ad407f060043677716806f"
+	for _, test := range []struct {
+		name, version, revision string
+		ok                      bool
+		want                    string
+	}{
+		{"v1 by default", "", v1Revision, true, KagentV1},
+		{"explicit v1", `"version":"v1",`, v1Revision, true, KagentV1},
+		{"v0 config hash", `"version":"v0",`, "15270541297416117040", true, KagentV0},
+		{"v0 with a v1 revision", `"version":"v0",`, v1Revision, false, ""},
+		{"v1 with a config hash", "", "15270541297416117040", false, ""},
+		{"v0 with a leading zero", `"version":"v0",`, "0123", false, ""},
+		{"unknown version", `"version":"v2",`, v1Revision, false, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := []byte(strings.Replace(strings.Replace(validConfig, v1Revision, test.revision, 1), `"kagent":{`, `"kagent":{`+test.version, 1))
+			agent, err := Decode(data, Digest(data), "kagent/kagent/probe")
+			if (err == nil) != test.ok {
+				t.Fatalf("Decode = %v, want ok %v", err, test.ok)
+			}
+			if test.ok && agent.Kagent.KagentVersion() != test.want {
+				t.Fatalf("version = %q, want %q", agent.Kagent.KagentVersion(), test.want)
+			}
+		})
+	}
+}

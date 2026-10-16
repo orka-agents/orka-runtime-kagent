@@ -40,6 +40,7 @@ var (
 	dnsLabel     = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 	dnsSubdomain = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
 	revision     = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	configHash   = regexp.MustCompile(`^(0|[1-9][0-9]{0,19})$`)
 	userIDPrefix = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$`)
 )
 
@@ -62,16 +63,37 @@ type Governed struct {
 	UpstreamModel string `json:"upstreamModel"`
 }
 
+// Kagent versions the adapter supports.
+const (
+	// KagentV1 is kagent v1, the Agent Substrate design (api.kagent.dev/v1alpha3).
+	KagentV1 = "v1"
+	// KagentV0 is kagent v0.x, which runs each Agent as a Deployment
+	// (kagent.dev/v1alpha2).
+	KagentV0 = "v0"
+)
+
 // Kagent identifies the kagent control plane and the exact Agent revision.
 type Kagent struct {
+	// Version selects the kagent API generation. Empty means KagentV1.
+	Version string `json:"version,omitempty"`
 	// ControlPlaneURL is the kagent controller's public API base URL.
 	ControlPlaneURL string   `json:"controlPlaneURL"`
 	Agent           AgentRef `json:"agent"`
-	// ExpectedRevision is the approved prepared revision; sessions that kagent
-	// pins to any other revision are refused before dispatch.
+	// ExpectedRevision pins what the Agent runs. For v1 it is the approved
+	// prepared revision, which kagent pins each session to. For v0 it is the
+	// kagent.dev/config-hash of the Agent's Deployment: a hash of its compiled
+	// config, agent card, and secrets. Anything else is refused before dispatch.
 	ExpectedRevision string `json:"expectedRevision"`
 	// UserIDPrefix prefixes the per-Orka-session kagent user identity.
 	UserIDPrefix string `json:"userIDPrefix"`
+}
+
+// KagentVersion returns the kagent API generation, defaulting to KagentV1.
+func (k Kagent) KagentVersion() string {
+	if k.Version == "" {
+		return KagentV1
+	}
+	return k.Version
 }
 
 // AgentRef names a kagent Agent.
@@ -108,10 +130,18 @@ func Decode(data []byte, digest, model string) (Agent, error) {
 		return Agent{}, ErrConfig
 	}
 	k := agent.Kagent
+	pin := revision
+	switch k.Version {
+	case "", KagentV1:
+	case KagentV0:
+		pin = configHash
+	default:
+		return Agent{}, ErrConfig
+	}
 	if _, err := ControlPlaneURL(k.ControlPlaneURL); err != nil ||
 		!dnsLabel.MatchString(k.Agent.Namespace) || len(k.Agent.Namespace) > 63 ||
 		!dnsSubdomain.MatchString(k.Agent.Name) || len(k.Agent.Name) > 253 ||
-		!revision.MatchString(k.ExpectedRevision) || !userIDPrefix.MatchString(k.UserIDPrefix) {
+		!pin.MatchString(k.ExpectedRevision) || !userIDPrefix.MatchString(k.UserIDPrefix) {
 		return Agent{}, ErrConfig
 	}
 	if g := agent.Governed; g != nil {

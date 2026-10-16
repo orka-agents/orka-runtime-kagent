@@ -54,14 +54,26 @@ type Session struct {
 	Deleting bool
 }
 
-// Client talks to one kagent Agent through the public control plane.
+// Client talks to one kagent v1 Agent through the public control plane.
 type Client struct {
-	conn        *grpc.ClientConn
-	sessions    apiv1.SessionServiceClient
-	a2a         a2apb.A2AServiceClient
-	agent       *apiv1.ResourceReference
-	url         string
+	a2aAccess
+	conn     *grpc.ClientConn
+	sessions apiv1.SessionServiceClient
+	a2a      a2apb.A2AServiceClient
+	agent    *apiv1.ResourceReference
+	url      string
+}
+
+// a2aAccess runs the A2A calls both kagent versions share. open builds a
+// client bound to the Agent and the caller's user; authorization, when set, is
+// forwarded to the Agent's model and MCP calls.
+type a2aAccess struct {
+	open        func(ctx context.Context, userID, authorization string) (*a2aclient.Client, error)
 	callTimeout time.Duration
+	// historyPublished reports that kagent lists a task with its input
+	// message from the start, so an unfinished task without the message
+	// cannot be hiding it. kagent v0 does; v1 withholds it until cleanup.
+	historyPublished bool
 }
 
 // New connects lazily to the control plane named by cfg.
@@ -86,11 +98,13 @@ func New(cfg config.Kagent) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{
+	c := &Client{
 		conn: conn, sessions: apiv1.NewSessionServiceClient(conn), a2a: a2apb.NewA2AServiceClient(conn),
 		agent: &apiv1.ResourceReference{Namespace: cfg.Agent.Namespace, Name: cfg.Agent.Name},
-		url:   base.String(), callTimeout: defaultCallTimeout,
-	}, nil
+		url:   base.String(),
+	}
+	c.a2aAccess = a2aAccess{open: c.a2aClientWith, callTimeout: defaultCallTimeout}
+	return c, nil
 }
 
 // Close releases the connection.
@@ -169,13 +183,9 @@ func classifyRPC(err error) error {
 	}
 }
 
-// a2aClient builds an A2A client bound to the Agent and the caller's user.
-func (c *Client) a2aClient(ctx context.Context, userID string) (*a2aclient.Client, error) {
-	return c.a2aClientWith(ctx, userID, "")
-}
-
-// a2aClientWith also sends authorization, which kagent forwards to the
-// Agent's model and MCP calls.
+// a2aClientWith builds a gRPC A2A client bound to the Agent and the caller's
+// user. It also sends authorization, which kagent forwards to the Agent's
+// model and MCP calls.
 func (c *Client) a2aClientWith(ctx context.Context, userID, authorization string) (*a2aclient.Client, error) {
 	transport := a2agrpc.NewGRPCTransportFromClient(c.a2a)
 	return a2aclient.NewFromEndpoints(ctx, []*a2atype.AgentInterface{{
@@ -210,9 +220,9 @@ func (i *userInterceptor) Before(ctx context.Context, request *a2aclient.Request
 
 // Stream sends one user message into an existing conversation and yields its
 // events. The message ID is the caller's durable dispatch identity.
-func (c *Client) Stream(ctx context.Context, userID, contextID, messageID, text, authorization string) iter.Seq2[a2atype.Event, error] {
+func (a *a2aAccess) Stream(ctx context.Context, userID, contextID, messageID, text, authorization string) iter.Seq2[a2atype.Event, error] {
 	return func(yield func(a2atype.Event, error) bool) {
-		client, err := c.a2aClientWith(ctx, userID, authorization)
+		client, err := a.open(ctx, userID, authorization)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -229,10 +239,10 @@ func (c *Client) Stream(ctx context.Context, userID, contextID, messageID, text,
 }
 
 // GetTask reads committed task state, including artifacts.
-func (c *Client) GetTask(ctx context.Context, userID string, taskID a2atype.TaskID) (*a2atype.Task, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.callTimeout)
+func (a *a2aAccess) GetTask(ctx context.Context, userID string, taskID a2atype.TaskID) (*a2atype.Task, error) {
+	ctx, cancel := context.WithTimeout(ctx, a.callTimeout)
 	defer cancel()
-	client, err := c.a2aClient(ctx, userID)
+	client, err := a.open(ctx, userID, "")
 	if err != nil {
 		return nil, err
 	}
@@ -245,10 +255,10 @@ func (c *Client) GetTask(ctx context.Context, userID string, taskID a2atype.Task
 // reports ErrNotFound only when the context has no unfinished task: kagent
 // withholds a task's input from public history until native cleanup ends, and
 // shows such a task as submitted until then.
-func (c *Client) FindTaskByMessage(ctx context.Context, userID, contextID, messageID string) (*a2atype.Task, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.callTimeout)
+func (a *a2aAccess) FindTaskByMessage(ctx context.Context, userID, contextID, messageID string) (*a2atype.Task, error) {
+	ctx, cancel := context.WithTimeout(ctx, a.callTimeout)
 	defer cancel()
-	client, err := c.a2aClient(ctx, userID)
+	client, err := a.open(ctx, userID, "")
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +277,7 @@ func (c *Client) FindTaskByMessage(ctx context.Context, userID, contextID, messa
 		}
 		unfinished = unfinished || pending
 		if response.NextPageToken == "" {
-			if unfinished {
+			if unfinished && !a.historyPublished {
 				return nil, ErrAmbiguous
 			}
 			return nil, ErrNotFound
@@ -306,10 +316,10 @@ func taskHasMessage(task *a2atype.Task, messageID string) bool {
 }
 
 // CancelTask asks kagent to cancel a task and returns its resulting state.
-func (c *Client) CancelTask(ctx context.Context, userID string, taskID a2atype.TaskID) (*a2atype.Task, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.callTimeout)
+func (a *a2aAccess) CancelTask(ctx context.Context, userID string, taskID a2atype.TaskID) (*a2atype.Task, error) {
+	ctx, cancel := context.WithTimeout(ctx, a.callTimeout)
 	defer cancel()
-	client, err := c.a2aClient(ctx, userID)
+	client, err := a.open(ctx, userID, "")
 	if err != nil {
 		return nil, err
 	}

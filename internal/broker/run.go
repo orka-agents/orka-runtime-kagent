@@ -57,7 +57,7 @@ func Run(args []string, getenv func(string) string) error {
 	if len(bearer) < 32 || strings.ContainsFunc(bearer, func(r rune) bool { return r <= ' ' || r == 0x7f }) || stateDir == "" {
 		return config.ErrConfig
 	}
-	client, err := kagent.New(agent.Kagent)
+	client, err := newRemote(agent.Kagent, getenv)
 	if err != nil {
 		return err
 	}
@@ -67,6 +67,7 @@ func Run(args []string, getenv func(string) string) error {
 	cfg := settings{
 		bearer: bearer, configDigest: getenv(config.ConfigDigestEnv), stateDir: stateDir, model: agent.Model,
 		expectedRevision: agent.Kagent.ExpectedRevision, userIDPrefix: agent.Kagent.UserIDPrefix,
+		kagentV0: agent.Kagent.KagentVersion() == config.KagentV0,
 	}
 	relayAddr := ""
 	if g := agent.Governed; g != nil {
@@ -127,6 +128,26 @@ func Run(args []string, getenv func(string) string) error {
 	shutdown, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	return server.Shutdown(shutdown)
+}
+
+// closableRemote is a kagent client the broker owns for its lifetime.
+type closableRemote interface {
+	remote
+	Close() error
+}
+
+// newRemote builds the client for the configured kagent version. A v0 Agent
+// is pinned by the config hash on its only pod, which the broker reads with its
+// pod's service account.
+func newRemote(cfg config.Kagent, getenv func(string) string) (closableRemote, error) {
+	if cfg.KagentVersion() != config.KagentV0 {
+		return kagent.New(cfg)
+	}
+	pin, err := kagent.NewAgentPods(cfg.Agent, getenv)
+	if err != nil {
+		return nil, err
+	}
+	return kagent.NewV0(cfg, pin)
 }
 
 func loopbackAddr(value string) (string, error) {

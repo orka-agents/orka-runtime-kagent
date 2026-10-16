@@ -19,8 +19,13 @@ const (
 	proofNotAccepted     = "kagent-send-not-accepted"
 	proofTaskTerminal    = "kagent-task-terminal"
 	proofSessionDeleted  = "kagent-session-not-found"
-	proofNeverCreated    = "never-created"
-	proofDeleted         = "kagent-delete-get-not-found"
+	// kagent v0's proofs for an ambiguous send whose task cannot be found,
+	// once its session is deleted: a governed turn's token is revoked, and
+	// every Agent pod that could have run an observed turn is gone.
+	proofTurnTokenRevoked = "kagent-v0-turn-token-revoked"
+	proofPodsReplaced     = "kagent-v0-agent-pods-replaced"
+	proofNeverCreated     = "never-created"
+	proofDeleted          = "kagent-delete-get-not-found"
 )
 
 func (b *lifecycleBroker) snapshot(key string) (*session, bool) {
@@ -107,9 +112,13 @@ func (b *lifecycleBroker) settlePrompt(ctx context.Context, key string, s *sessi
 			kinds = append(kinds, proofNeverDispatched)
 		case invocationRejected:
 			kinds = append(kinds, proofNotAccepted)
-		case invocationCompleted:
-			kinds = append(kinds, proofTaskTerminal)
-		case invocationIntent, invocationAccepted:
+		case invocationCompleted, invocationIntent, invocationAccepted:
+			// A terminal task settles a v1 prompt. kagent v0 can record one
+			// before its execution has unwound, so v0 resolves it once more.
+			if inv.State == invocationCompleted && !b.cfg.kagentV0 {
+				kinds = append(kinds, proofTaskTerminal)
+				continue
+			}
 			if s.CreateState != createKnown {
 				return false
 			}
@@ -132,7 +141,9 @@ func (b *lifecycleBroker) settlePrompt(ctx context.Context, key string, s *sessi
 		Kinds                 []string
 		At                    string
 	}{key, promptKey, config.Digest([]byte(s.RemoteID)), kinds, b.cfg.now().UTC().Format(time.RFC3339Nano)})
-	return b.applyInvocations(key, promptKey, updates, proof, slices.Contains(kinds, proofSessionDeleted))
+	gone := slices.Contains(kinds, proofSessionDeleted) || slices.Contains(kinds, proofTurnTokenRevoked) ||
+		slices.Contains(kinds, proofPodsReplaced)
+	return b.applyInvocations(key, promptKey, updates, proof, gone)
 }
 
 // resolveInvocation turns an intent or accepted invocation into a terminal
@@ -148,10 +159,21 @@ func (b *lifecycleBroker) resolveInvocation(ctx context.Context, s *session, inv
 		task, err := b.remote.FindTaskByMessage(ctx, s.UserID, s.RemoteID, inv.MessageID)
 		switch {
 		case err == nil && task != nil:
-		case b.sessionDeleted(ctx, s):
+		case b.cfg.kagentV0 && !inv.FencedAt.IsZero():
+			// The session is already deleted, so it can no longer be listed.
+			return b.fenceV0(ctx, s, inv)
+		case !b.cfg.kagentV0 && b.sessionDeleted(ctx, s):
 			inv.State = invocationSettled
 			return proofSessionDeleted, true
-		case patient || (!errors.Is(err, kagent.ErrNotFound) && !errors.Is(err, kagent.ErrAmbiguous)):
+		case patient:
+			return "", false
+		case b.cfg.kagentV0 && (errors.Is(err, kagent.ErrNotFound) || b.sessionDeleted(ctx, s)):
+			// No task holds the message, or the session is gone and its tasks
+			// can no longer be listed.
+			return b.fenceV0(ctx, s, inv)
+		case !errors.Is(err, kagent.ErrNotFound) && !errors.Is(err, kagent.ErrAmbiguous):
+			return "", false
+		case b.cfg.kagentV0:
 			return "", false
 		default:
 			if err := b.remote.DeleteSession(ctx, s.UserID, s.RemoteID); err != nil && !errors.Is(err, kagent.ErrNotFound) {
@@ -164,19 +186,24 @@ func (b *lifecycleBroker) resolveInvocation(ctx context.Context, s *session, inv
 			return proofSessionDeleted, true
 		}
 		inv.State, inv.TaskID = invocationAccepted, string(task.ID)
-		if task.Status.State.Terminal() {
+		if task.Status.State.Terminal() && !b.cfg.kagentV0 {
 			inv.State, inv.Terminal = invocationCompleted, string(task.Status.State)
 			return proofTaskTerminal, true
 		}
 	}
 	task, err := b.remote.GetTask(ctx, s.UserID, a2atype.TaskID(inv.TaskID))
-	if err == nil && task != nil && !task.Status.State.Terminal() {
+	if err == nil && task != nil && (b.cfg.kagentV0 || !task.Status.State.Terminal()) {
 		// Waiting states (input-required, auth-required) are not terminal;
 		// observer disconnection never stops kagent, so cancel explicitly.
+		// kagent v0 records a cancellation before its execution has unwound,
+		// so a v0 task is asked even when it reads terminal: only a cancel
+		// that returns proves no execution of it is left.
 		task, err = b.remote.CancelTask(ctx, s.UserID, a2atype.TaskID(inv.TaskID))
 	}
 	if err != nil || task == nil || !task.Status.State.Terminal() {
-		if b.sessionDeleted(ctx, s) {
+		// v0 keeps a deleted session's tasks readable and running, so only
+		// the task's own state can settle it there.
+		if !b.cfg.kagentV0 && b.sessionDeleted(ctx, s) {
 			inv.State = invocationSettled
 			return proofSessionDeleted, true
 		}
@@ -184,6 +211,51 @@ func (b *lifecycleBroker) resolveInvocation(ctx context.Context, s *session, inv
 	}
 	inv.State, inv.Terminal = invocationCompleted, string(task.Status.State)
 	return proofTaskTerminal, true
+}
+
+// fenceV0 settles a kagent v0 send whose task cannot be found. A listing is
+// only a snapshot: v0 may save a late-admitted turn's task after it. Deleting
+// the session stops such a turn before its next tool, but not a model or tool
+// call it already has in flight, and no timeout bounds that call once
+// retries are counted.
+//
+// A governed turn needs nothing more: its token died with the turn, so a late
+// execution reaches neither Orka's tools nor its model. An observed turn runs
+// kagent's own tools. It settles once every Agent pod that existed when the
+// session was deleted is gone: an execution lives in its pod's process, and a
+// newer pod cannot run a turn whose session it can no longer load. Restarting
+// the Agent's Deployment resolves it. This trusts that a pod object is removed
+// only after its containers stop, which holds unless someone force-deletes it.
+func (b *lifecycleBroker) fenceV0(ctx context.Context, s *session, inv *invocation) (string, bool) {
+	if err := b.remote.DeleteSession(ctx, s.UserID, s.RemoteID); err != nil && !errors.Is(err, kagent.ErrNotFound) {
+		return "", false
+	}
+	if !b.sessionDeleted(ctx, s) {
+		return "", false
+	}
+	if b.cfg.governed != nil {
+		inv.State = invocationSettled
+		return proofTurnTokenRevoked, true
+	}
+	pods, ok := b.remote.(agentPods)
+	if !ok {
+		return "", false
+	}
+	current, err := pods.AgentPodUIDs(ctx)
+	if err != nil || len(current) > maxFencedPods {
+		return "", false
+	}
+	if inv.FencedAt.IsZero() {
+		inv.FencedAt, inv.FencedPods = b.cfg.now(), current
+		return "", false
+	}
+	for _, uid := range current {
+		if slices.Contains(inv.FencedPods, uid) {
+			return "", false
+		}
+	}
+	inv.State = invocationSettled
+	return proofPodsReplaced, true
 }
 
 // sessionDeleted reports kagent's proof that the session no longer exists.

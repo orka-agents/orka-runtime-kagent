@@ -40,6 +40,13 @@ const (
 	defaultRetiredRetention = 24 * time.Hour
 )
 
+// agentPods is the kagent v0 client's view of the pods that run the Agent.
+// An execution lives in its pod's process, so a pod that is gone has nothing
+// left running.
+type agentPods interface {
+	AgentPodUIDs(ctx context.Context) ([]string, error)
+}
+
 // remote is the kagent surface the broker depends on.
 type remote interface {
 	CreateSession(ctx context.Context, userID, requestID string) (kagent.Session, error)
@@ -58,6 +65,9 @@ type settings struct {
 	model            string
 	expectedRevision string
 	userIDPrefix     string
+	// kagentV0 applies kagent v0.x rules: deleting a session does not stop its
+	// work, so deletion never proves settlement.
+	kagentV0         bool
 	operationTimeout time.Duration
 	keepalive        time.Duration
 	cleanupDeadline  time.Duration
