@@ -219,8 +219,12 @@ file contains the broker bearer.
 Run governed agents in a dedicated kagent install:
 
 - Allow only the broker to reach the public API.
-- Set `config.runtimeDefaults.controlPlaneUrl` to a proxy that forwards only
-  the `kagent.runtime.v1.TaskStoreService` methods.
+- Set `config.runtimeDefaults.controlPlaneUrl` to a proxy that forwards
+  exactly the five `kagent.runtime.v1.TaskStoreService` methods: `CreateTask`,
+  `GetTask`, `UpdateTask`, `ListTasks`, and `SettleTask`. Match exact paths, not
+  a prefix; `kagent.runtime.v1.MemoryService` uses ordinary public auth.
+- Before supporting a new version tuple, run the
+  [release gate](conformance/README.md).
 - Restart the kagent controller after changing its config.
 
 ## Build
