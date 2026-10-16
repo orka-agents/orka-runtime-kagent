@@ -295,9 +295,12 @@ where this section says otherwise.
 - **Settlement.** Deleting a v0 session only marks its row; a running turn
   finishes its current model or tool call and then fails at its next session
   write. So deletion never settles a known task. kagent v0 also records a
-  cancellation before the execution has unwound, so a task settles only once
-  a cancel call returns: that call waits for a running execution to end.
-  kagent writes `completed` and `failed` only as the executor's last action.
+  cancellation before the execution has unwound, so an unfinished or
+  canceled task settles only once a cancel call returns: that call waits for
+  a running execution to end. A `completed` or `failed` task settles as
+  written, because kagent writes those only as the executor's last action.
+  (kagent v0.10's controller cannot relay a refusal to cancel a finished
+  task; it answers an internal error.)
 - **Ambiguous sends.** When a send's outcome is unknown and no task holds the
   message after the dispatch window, the broker deletes the session, which
   stops any turn before its next tool. A deleted session's tasks can no

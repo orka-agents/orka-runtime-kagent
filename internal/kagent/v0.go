@@ -147,15 +147,18 @@ func (c *V0Client) GetSession(ctx context.Context, userID, id string) (Session, 
 // its pod's process, so once a pod is gone so is everything it ran.
 func (c *V0Client) AgentPodUIDs(ctx context.Context) ([]string, error) { return c.pin.PodUIDs(ctx) }
 
-// CancelTask cancels a task and returns it only once its executor is done.
-// kagent v0 runs tasks in the Agent pod's in-process execution manager. It
-// records a cancellation before the executor has unwound, but a cancel of a
-// canceled or unfinished task waits for a running execution to end. kagent's
-// executor writes a completed or failed status only as its final statement
-// (return queue.Write in go/adk/pkg/a2a/executor.go), so such a task's
-// executor is finished, and its cancel is refused with ErrTaskNotCancelable.
-// A cancel reaches only one pod, so it is sent only while the Agent runs
-// exactly one.
+// CancelTask cancels an unfinished or canceled task and returns it only once
+// its executor is done. kagent v0 runs tasks in the Agent pod's in-process
+// execution manager, which records a cancellation before the executor has
+// unwound but makes a cancel of an unfinished or canceled task wait for a
+// running execution to end. A cancel reaches only one pod, so it is sent only
+// while the Agent runs exactly one.
+//
+// The broker never needs to cancel a completed or failed task: kagent's
+// executor writes those statuses only as its final statement (return
+// queue.Write in go/adk/pkg/a2a/executor.go). kagent v0.10's controller also
+// cannot relay the Agent's refusal to cancel one; it answers an internal
+// error. A refusal that does arrive is answered with the task itself.
 func (c *V0Client) CancelTask(ctx context.Context, userID string, taskID a2atype.TaskID) (*a2atype.Task, error) {
 	if _, err := c.pin.ConfigHash(ctx); err != nil {
 		return nil, err

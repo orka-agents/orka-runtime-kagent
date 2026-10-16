@@ -113,8 +113,9 @@ func (b *lifecycleBroker) settlePrompt(ctx context.Context, key string, s *sessi
 		case invocationRejected:
 			kinds = append(kinds, proofNotAccepted)
 		case invocationCompleted, invocationIntent, invocationAccepted:
-			// A terminal task settles a v1 prompt. kagent v0 can record one
-			// before its execution has unwound, so v0 resolves it once more.
+			// A terminal task settles a v1 prompt. kagent v0 can record a
+			// cancellation before its execution has unwound, so v0 reads the
+			// task once more.
 			if inv.State == invocationCompleted && !b.cfg.kagentV0 {
 				kinds = append(kinds, proofTaskTerminal)
 				continue
@@ -192,12 +193,13 @@ func (b *lifecycleBroker) resolveInvocation(ctx context.Context, s *session, inv
 		}
 	}
 	task, err := b.remote.GetTask(ctx, s.UserID, a2atype.TaskID(inv.TaskID))
-	if err == nil && task != nil && (b.cfg.kagentV0 || !task.Status.State.Terminal()) {
+	if err == nil && task != nil && (!task.Status.State.Terminal() || (b.cfg.kagentV0 && task.Status.State == a2atype.TaskStateCanceled)) {
 		// Waiting states (input-required, auth-required) are not terminal;
 		// observer disconnection never stops kagent, so cancel explicitly.
 		// kagent v0 records a cancellation before its execution has unwound,
-		// so a v0 task is asked even when it reads terminal: only a cancel
-		// that returns proves no execution of it is left.
+		// so a canceled v0 task is cancelled again: the call returns only once
+		// no execution of it is left. kagent v0 writes completed and failed
+		// only as its executor's final statement, so those need no call.
 		task, err = b.remote.CancelTask(ctx, s.UserID, a2atype.TaskID(inv.TaskID))
 	}
 	if err != nil || task == nil || !task.Status.State.Terminal() {

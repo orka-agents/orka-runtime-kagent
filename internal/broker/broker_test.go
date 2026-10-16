@@ -1139,8 +1139,8 @@ func TestV0ExternallyDeletedSessionIsFencedOnItsPods(t *testing.T) {
 	}
 }
 
-// kagent v0 records a cancellation before its execution has unwound, so a v0
-// task settles only once a cancel call returns, even when it reads terminal.
+// kagent v0 records a cancellation before its execution has unwound, so a
+// canceled v0 task settles only once a cancel call returns.
 func TestV0TaskSettlesOnlyWhenACancelReturns(t *testing.T) {
 	for _, v0 := range []bool{false, true} {
 		remote := newFakeRemote()
@@ -1165,16 +1165,19 @@ func TestV0TaskSettlesOnlyWhenACancelReturns(t *testing.T) {
 	}
 }
 
-func TestV0CompletedTurnSettlesThroughACancel(t *testing.T) {
+// kagent v0.10's controller answers a cancel of a finished task with an
+// internal error, so a completed v0 turn must settle without one.
+func TestV0CompletedTurnSettlesWithoutACancel(t *testing.T) {
 	remote := newFakeRemote()
 	remote.streams = append(remote.streams, completedStream(remote, "task-1", "ok"))
+	remote.cancelErr = errors.New("failed to decode response")
 	h := newV0Harness(t, remote)
 	o, p := testOwner(1), h.prompt("prompt-1")
 	if recorder := h.turn(o, p); recorder.Code != http.StatusOK {
 		t.Fatalf("turn = %d", recorder.Code)
 	}
-	if !h.control(settlePath, o, p).SettlementProven || remote.count("cancel task-1") == 0 {
-		t.Fatalf("a v0 turn settled without a cancel acknowledgement: %v", remote.snapshotCalls())
+	if !h.control(settlePath, o, p).SettlementProven || remote.count("cancel task-1") != 0 {
+		t.Fatalf("a completed v0 turn did not settle on its own: %v", remote.snapshotCalls())
 	}
 }
 
