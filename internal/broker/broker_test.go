@@ -1181,6 +1181,41 @@ func TestV0CompletedTurnSettlesWithoutACancel(t *testing.T) {
 	}
 }
 
+// kagent v0 marks tool parts with the ADK's adk_type key, not v1's part type.
+func TestV0TurnStreamsToolActivity(t *testing.T) {
+	v0Tool := func(kind string, data map[string]any) *a2atype.Part {
+		part := a2atype.NewDataPart(data)
+		part.SetMeta("adk_type", kind)
+		return part
+	}
+	remote := newFakeRemote()
+	remote.streams = append(remote.streams, func(_ context.Context, contextID, messageID string) []item {
+		call := v0Tool("function_call", map[string]any{"id": "call-1", "name": "probe", "args": map[string]any{"secret": "x"}})
+		result := v0Tool("function_response", map[string]any{"id": "call-1", "name": "probe", "response": map[string]any{"secret": "y"}})
+		task := &a2atype.Task{ID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateCompleted},
+			Artifacts: []*a2atype.Artifact{{ID: "text", Parts: []*a2atype.Part{call, a2atype.NewTextPart("probe-done")}}}}
+		remote.setTask(task, messageID)
+		return []item{
+			{event: &a2atype.Task{ID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking}}},
+			{event: &a2atype.TaskStatusUpdateEvent{TaskID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking,
+				Message: a2atype.NewMessage(a2atype.MessageRoleAgent, call)}}},
+			{event: &a2atype.TaskStatusUpdateEvent{TaskID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking,
+				Message: a2atype.NewMessage(a2atype.MessageRoleAgent, result)}}},
+			{event: &a2atype.TaskStatusUpdateEvent{TaskID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateCompleted}}},
+		}
+	})
+	h := newV0Harness(t, remote)
+	recorder := h.turn(testOwner(1), h.prompt("prompt-1"))
+	got := names(parseSSE(t, recorder.Body.String()))
+	want := "response.created,response.kagent_tool.started,response.kagent_tool.finished,response.output_text.delta,response.completed"
+	if got != want {
+		t.Fatalf("events = %s, want %s", got, want)
+	}
+	if strings.Contains(recorder.Body.String(), "secret") {
+		t.Fatal("tool arguments or results reached the stream")
+	}
+}
+
 func TestV0DeletedSessionNeverProvesSettlement(t *testing.T) {
 	for _, v0 := range []bool{false, true} {
 		remote := newFakeRemote()

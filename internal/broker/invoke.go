@@ -205,6 +205,9 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 				}
 			case *a2atype.TaskStatusUpdateEvent:
 				state = e.Status.State
+				if e.Status.Message != nil {
+					tools.relay(e.Status.Message.Parts)
+				}
 			case *a2atype.Task:
 				state = e.Status.State
 			}
@@ -288,7 +291,7 @@ func taskText(task *a2atype.Task) (string, bool) {
 		}
 		var run strings.Builder
 		for _, part := range artifact.Parts {
-			if _, tool := apia2a.ParseToolActivity(part); tool || part == nil {
+			if _, tool := kagent.ToolActivity(part); tool || part == nil {
 				continue
 			}
 			run.WriteString(part.Text())
@@ -572,18 +575,22 @@ func invocationFor(l *ledger, key, promptKey string, sequence uint64) *invocatio
 }
 
 // toolRelay emits observed kagent tool activity: names and status only.
+// toolRelay reports each kagent tool call to Orka once, however many events
+// repeat it: kagent v0 mirrors tool parts in status messages, and v1 in
+// artifacts.
 type toolRelay struct {
-	stream *sse
-	ids    map[string]string
+	stream   *sse
+	ids      map[string]string
+	finished map[string]bool
 }
 
 func newToolRelay(stream *sse) *toolRelay {
-	return &toolRelay{stream: stream, ids: map[string]string{}}
+	return &toolRelay{stream: stream, ids: map[string]string{}, finished: map[string]bool{}}
 }
 
 func (t *toolRelay) relay(parts []*a2atype.Part) {
 	for _, part := range parts {
-		activity, ok := apia2a.ParseToolActivity(part)
+		activity, ok := kagent.ToolActivity(part)
 		if !ok {
 			continue
 		}
@@ -601,9 +608,10 @@ func (t *toolRelay) relay(parts []*a2atype.Part) {
 			t.ids[activity.ID] = id
 			_ = t.stream.event("response.kagent_tool.started", map[string]any{"type": "response.kagent_tool.started", "tool": map[string]string{"id": id, "name": name}})
 		case apia2a.ToolResultKind:
-			if !seen {
+			if !seen || t.finished[activity.ID] {
 				continue
 			}
+			t.finished[activity.ID] = true
 			_ = t.stream.event("response.kagent_tool.finished", map[string]any{"type": "response.kagent_tool.finished", "tool": map[string]string{"id": id, "name": name, "status": "completed"}})
 		}
 	}
