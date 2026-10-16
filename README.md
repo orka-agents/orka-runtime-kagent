@@ -1,11 +1,19 @@
 # kagent runtime adapter for Orka
 
-This adapter lets Orka govern an agent that runs on [kagent](https://github.com/kagent-dev/kagent)
-v1, the Substrate-based design. kagent keeps running the agent's reasoning loop.
-Orka owns how work reaches the agent, its identity and lifecycle, and the audit record.
+This adapter lets Orka govern an agent that runs on [kagent](https://github.com/kagent-dev/kagent).
+kagent keeps running the agent's reasoning loop. Orka owns how work reaches the
+agent, its identity and lifecycle, and the audit record.
 
-> **Status:** experimental. It is tested against kagent
-> `1eb89fb1` (v1.0.0-alpha13+31) with kagent's Substrate fork v0.5.0-alpha2.
+It supports two kagent lines:
+
+- **kagent v1** (`api.kagent.dev/v1alpha3`), the Substrate-based design. Most
+  of this README describes it.
+- **kagent v0.x** (`kagent.dev/v1alpha2`), which runs each Agent as a
+  Deployment. See [kagent v0.x](#kagent-v0x) for what differs.
+
+> **Status:** experimental. v1 is tested against kagent `1eb89fb1`
+> (v1.0.0-alpha13+31) with kagent's Substrate fork v0.5.0-alpha2. v0 is tested
+> against kagent v0.10.3 with the Go runtime.
 
 ## How it fits together
 
@@ -201,6 +209,8 @@ its SHA-256 against `ORKA_KAGENT_ACP_AGENT_CONFIGURATION_DIGEST`.
 
 - `model` is the profile model string Orka pins. kagent owns the real model.
 - `controlPlaneURL` must name a DNS host with no path.
+- `kagent.version` is `v1` (the default) or `v0`. For v0, `expectedRevision`
+  is the decimal `kagent.dev/config-hash` of the Agent's pod.
 
 | Process | Variable | Purpose |
 | --- | --- | --- |
@@ -264,6 +274,146 @@ who can dispatch work to any wrapped Agent.
   [release gate](conformance/README.md).
 - Restart the kagent controller after changing its config.
 
+## kagent v0.x
+
+Set `"version": "v0"` in the `kagent` section of `kagent.json`; the import step
+does this for `kagent.dev/v1alpha2` Agents. Everything above applies except
+where this section says otherwise.
+
+### How v0 differs
+
+- **Transport.** The broker uses the controller's REST session API and A2A
+  over JSON-RPC at `/api/a2a/<namespace>/<name>/`, not v1's gRPC services.
+- **Pinning.** v0 has no revisions. `expectedRevision` is the
+  `kagent.dev/config-hash` annotation on the Agent's pod: a hash of the
+  compiled config, agent card, and secrets, so it changes when the Agent or
+  anything it references changes. Before every dispatch the broker requires
+  exactly one ready pod object with that hash. A rollout or restart in
+  progress, terminating pods included, refuses the turn.
+- **One replica.** A cancel reaches only the pod that runs the task, so a
+  wrapped v0 Agent must run a single replica.
+- **Settlement.** Deleting a v0 session only marks its row; a running turn
+  finishes its current model or tool call and then fails at its next session
+  write. So deletion never settles a known task. kagent v0 also records a
+  cancellation before the execution has unwound, so a task settles only once
+  a cancel call returns: that call waits for a running execution to end.
+  kagent writes `completed` and `failed` only as the executor's last action.
+- **Ambiguous sends.** When a send's outcome is unknown and no task holds the
+  message after the dispatch window, the broker deletes the session, which
+  stops any turn before its next tool. A deleted session's tasks can no
+  longer be listed, so:
+  - a **governed** send settles at once: its turn token died with the turn,
+    so a late execution reaches neither Orka's tools nor its model;
+  - an **observed** send settles once every Agent pod that existed at the
+    deletion is gone. Restart the Agent's Deployment to resolve it sooner.
+    This trusts that pods are deleted gracefully: never force-delete a
+    wrapped Agent's pod while a send waits on it.
+- **Cancellation** stops a running turn only on the Go runtime, and a client
+  disconnect never does. The import refuses Python-runtime Agents: they cannot
+  cancel, and they store every request header, including the turn token, in
+  kagent's database.
+- **MCP sessions.** The Go runtime opens one MCP session per process and
+  reuses it across turns and Orka sessions. The relay authorizes each request
+  by its turn token, not by the session.
+
+### What the v0 install must look like
+
+Run wrapped Agents in a dedicated kagent install, as for v1, with the Go
+runtime (`declarative.runtime: go`) and one replica.
+
+- **Isolation.** v0 ships no NetworkPolicies, its default `unsecure` auth mode
+  accepts any `X-User-Id`, and its authorization is a no-op. Without these
+  policies any pod can drive an Orka-owned session or read its tasks:
+
+  ```yaml
+  # Agent pods: only kagent's controller, which proxies A2A, reaches them.
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: kagent-agents-ingress, namespace: kagent}
+  spec:
+    podSelector:
+      matchLabels: {app: kagent, app.kubernetes.io/managed-by: kagent}
+    policyTypes: [Ingress]
+    ingress:
+      - from:
+          - podSelector:
+              matchLabels: {app.kubernetes.io/name: kagent, app.kubernetes.io/component: controller}
+        ports: [{port: 8080, protocol: TCP}]
+  ---
+  # Controller API: only the Agents' callbacks and the brokers.
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: kagent-controller-ingress, namespace: kagent}
+  spec:
+    podSelector:
+      matchLabels: {app.kubernetes.io/name: kagent, app.kubernetes.io/component: controller}
+    policyTypes: [Ingress]
+    ingress:
+      - from:
+          - podSelector:
+              matchLabels: {app: kagent, app.kubernetes.io/managed-by: kagent}
+          - namespaceSelector:
+              matchLabels: {kubernetes.io/metadata.name: orka-system}
+            podSelector:
+              matchLabels: {orka.ai/kagent-broker: "true"}
+        ports: [{port: 8083, protocol: TCP}]
+  ---
+  # Bundled PostgreSQL, whose credentials are fixed: only the controller.
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: kagent-postgresql-ingress, namespace: kagent}
+  spec:
+    podSelector:
+      matchLabels: {app.kubernetes.io/name: kagent, app.kubernetes.io/component: database}
+    policyTypes: [Ingress]
+    ingress:
+      - from:
+          - podSelector:
+              matchLabels: {app.kubernetes.io/name: kagent, app.kubernetes.io/component: controller}
+        ports: [{port: 5432, protocol: TCP}]
+  ```
+
+  Label each wrapper pod `orka.ai/kagent-broker: "true"`. Turn off kagent's
+  UI or keep it off this network: it calls the controller as any user.
+- **Broker access to the Agent's pods.** The broker lists the Agent's pods
+  with its pod's service account. Grant `get` and `list` on `pods` in the
+  Agent's namespace, and mount a token into the broker container only:
+
+  ```yaml
+  # In the wrapper pod spec; automountServiceAccountToken stays false.
+  volumes:
+    - name: broker-kube
+      projected:
+        sources:
+          - serviceAccountToken: {path: token, expirationSeconds: 3600}
+          - configMap: {name: kube-root-ca.crt, items: [{key: ca.crt, path: ca.crt}]}
+  # In the broker container:
+  volumeMounts:
+    - {name: broker-kube, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true}
+  ```
+- **Governed v0 Agents** (the import checks these):
+  - the model is an OpenAI `ModelConfig` with `openAI.baseUrl` set to the
+    relay's `/v1`, `apiKeyPassthrough: true`, and the chat completions format;
+  - every tool binding names a `RemoteMCPServer` at the relay's `/mcp`, with
+    protocol `STREAMABLE_HTTP` and a `timeout` longer than `20m`;
+  - each binding sets `allowedHeaders: [Authorization]`, so kagent forwards
+    the turn token, and nothing sets `headersFrom`, which would override it;
+  - no `requireApproval`, skills, `executeCodeBlocks`, memory, `shareTools`,
+    Agent tools, or deployment environment overrides.
+
+### v0 quarantine runbook
+
+The broker logs the same `kagent session quarantined` line. Deleting the
+session does not resolve a v0 quarantine, because it does not stop a running
+turn:
+
+1. If the logged tasks are still running, cancel them with A2A `CancelTask`
+   as the logged user.
+2. If the Agent's pod has restarted since, its executions are gone, and the
+   broker's next cancel settles the task.
+3. An observed send that left no task settles once the Agent's pods that
+   existed at the fence are gone; restart the Agent's Deployment.
+
 ## Build
 
 ```sh
@@ -292,6 +442,8 @@ make docker-build-acp-kagent-runtime \
     24 MiB, and the broker answers 503. The last 8 MiB stays for settling and
     retiring what the ledger already holds.
 - **One request per prompt.** Each prompt sends a single request to the broker.
+- **kagent v0 shares one Agent process across every Orka session.** Sessions
+  are separated by kagent user and session ID, not by process.
 - **Claude and Codex harnesses are observed only.** They reject
   `apiKeyPassthrough`, so the relay cannot tell which session is calling.
 - **kagent prerelease constraints apply:**

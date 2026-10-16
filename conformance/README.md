@@ -79,3 +79,28 @@ a token that can create Tasks and decide approvals. The other settings, such
 as namespaces and Agent names, default to the verification cluster's names.
 Override them through the environment variables listed at the top of the
 script.
+
+## kagent v0.x
+
+`KAGENT_VERSION=v0` runs the checks for a kagent v0.x tuple: kagent, the Go
+ADK image, and Kubernetes. The v1 checks for the control-plane filter, the
+compiled egress, and the router do not apply. These run instead:
+
+| Check | Proves |
+| --- | --- |
+| compiled v0 settings | The governed Agent runs one Go replica. Its compiled config forwards the turn token to the relay for the model and every tool, and enables no approvals, code execution, memory, or Agent tools. |
+| observed, deadline, and delete checks | As for v1. |
+| governed turn, twice | The second turn reuses the MCP session the Agent's process opened in the first. |
+| approval expiry and relay authentication | As for v1. |
+| v0 ingress | A pod elsewhere reaches neither the Agents, the controller, nor its database. |
+| timeout chain | As for v1, on the `kagent.dev` RemoteMCPServer. |
+| config pin | Changing the observed Agent's ModelConfig changes its config hash, and the wrapper refuses the Agent until the original config is back. The check restores the ModelConfig. |
+| session retirement | Every kagent session Orka created is marked deleted. |
+
+The observed Agent's tool binding must set `allowedHeaders: [X-User-Id]`.
+kagent v0 forwards the calling user to an MCP server only when a binding
+allows it, and the gate ties probe evidence to that user.
+
+```sh
+KAGENT_VERSION=v0 LONG=1 ORKA=./orka.sh conformance/release-gate.sh
+```

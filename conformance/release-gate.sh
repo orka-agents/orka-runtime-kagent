@@ -9,6 +9,7 @@ set -uo pipefail
 
 : "${KUBECONFIG:?set KUBECONFIG to the test cluster}"
 ORKA=${ORKA:-./orka.sh}                 # orka CLI already bound to the server and a token
+KAGENT_VERSION=${KAGENT_VERSION:-v1}    # v1 (Substrate) or v0 (kagent v0.x, one Deployment per Agent)
 ORKA_NS=${ORKA_NS:-orka-system}
 KAGENT_NS=${KAGENT_NS:-kagent}
 PROBE_NS=${PROBE_NS:-probe}
@@ -16,6 +17,7 @@ OBSERVED_AGENT=${OBSERVED_AGENT:-probe}
 GOVERNED_AGENT=${GOVERNED_AGENT:-probe-gov}
 GOVERNED_TOOL=${GOVERNED_TOOL:-probe-orka}
 GOVERNED_KAGENT_AGENT=${GOVERNED_KAGENT_AGENT:-probe-gov}
+OBSERVED_KAGENT_AGENT=${OBSERVED_KAGENT_AGENT:-probe}
 RELAY_SERVICE=${RELAY_SERVICE:-probe-kagent-relay}
 RELAY_SERVER=${RELAY_SERVER:-orka-relay}        # the governed Agent's RemoteMCPServer
 CPFILTER_SERVICE=${CPFILTER_SERVICE:-probe-cpfilter}
@@ -27,14 +29,24 @@ PROVIDER_DEFAULT_HOSTS=${PROVIDER_DEFAULT_HOSTS:-https://api.openai.com:443}
 ROUTER_NS=${ROUTER_NS:-ate-system}
 ROUTER_SERVICE=${ROUTER_SERVICE:-atenet-router}
 OUTSIDER_NS=${OUTSIDER_NS:-default}     # a namespace the router must not admit
-OUTSIDER_CONTROL_URL=${OUTSIDER_CONTROL_URL:-$CPFILTER_URL}   # any Service that namespace can reach
+if [[ $KAGENT_VERSION == v0 ]]; then
+  KAGENT_GROUP=kagent.dev
+  OUTSIDER_CONTROL_URL=${OUTSIDER_CONTROL_URL:-http://probe-model.$PROBE_NS.svc:8080}   # any Service that namespace can reach
+else
+  KAGENT_GROUP=api.kagent.dev
+  OUTSIDER_CONTROL_URL=${OUTSIDER_CONTROL_URL:-$CPFILTER_URL}
+fi
+KAGENT_CONTROLLER_SERVICE=${KAGENT_CONTROLLER_SERVICE:-kagent-controller}
+PG_SERVICE=${PG_SERVICE:-kagent-postgresql}
 CURL_IMAGE=${CURL_IMAGE:-docker.io/curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b}
 LONG=${LONG:-0}                         # 1 also runs the 10-minute approval-expiry check
 RUN=${RUN:-gate-$(date +%s)}
 WORK=$(mktemp -d)
 OUTSIDER_POD=gate-router-$RUN
+RESTORE=""                              # a command that undoes a check's change to the cluster
 trap 'rm -rf "$WORK"; [[ -n ${FORWARD_PID:-} ]] && kill "$FORWARD_PID" 2>/dev/null
-  kubectl -n "$OUTSIDER_NS" delete pod "$OUTSIDER_POD" --ignore-not-found --wait=false >/dev/null 2>&1' EXIT
+  kubectl -n "$OUTSIDER_NS" delete pod "$OUTSIDER_POD" --ignore-not-found --wait=false >/dev/null 2>&1
+  [[ -n $RESTORE ]] && eval "$RESTORE"' EXIT
 
 failures=0
 skipped=0
@@ -227,8 +239,8 @@ check_delete_cancel() {
   fi
 }
 
-check_governed_turn() {
-  local name="$RUN-governed"
+check_governed_turn() { # check_governed_turn [<name suffix>]
+  local name="$RUN-governed${1:-}"
   create_task "$name" "$GOVERNED_AGENT" 10m "[$GOVERNED_TOOL]"
   $ORKA task approvals "$name" --watch --timeout 4m >/dev/null 2>&1
   local id approved=no
@@ -239,9 +251,9 @@ check_governed_turn() {
   local usage; usage=$($ORKA task events "$name" -o json 2>/dev/null |
     jq '[if type == "array" then .[] else (.events // .items // [])[] end | select(.type == "ModelUsageUpdated") | .inputTokens // 0] | add // 0')
   if [[ $approved == yes && $phase == Succeeded && $seen == *ApprovalApproved*ToolCallCompleted* && ${usage:-0} -gt 0 ]]; then
-    pass "governed turn: Orka gates, executes, and counts the kagent Agent's call"
+    pass "governed turn${1:+ $1}: Orka gates, executes, and counts the kagent Agent's call"
   else
-    fail "governed turn" "approved=$approved phase=$phase usage=${usage:-0} events=$seen"
+    fail "governed turn${1:+ $1}" "approved=$approved phase=$phase usage=${usage:-0} events=$seen"
   fi
 }
 
@@ -340,7 +352,7 @@ check_compiled_egress() {
 }
 
 check_timeout_chain() {
-  local timeout; timeout=$(kubectl -n "$KAGENT_NS" get remotemcpservers.api.kagent.dev "$RELAY_SERVER" -o jsonpath='{.spec.timeout}')
+  local timeout; timeout=$(kubectl -n "$KAGENT_NS" get "remotemcpservers.$KAGENT_GROUP" "$RELAY_SERVER" -o jsonpath='{.spec.timeout}')
   local seconds; seconds=$(python3 -c "import re,sys; m=re.fullmatch(r'(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?', sys.argv[1]); print(int(int(m[1] or 0)*3600+int(m[2] or 0)*60+float(m[3] or 0)) if m and sys.argv[1] else 0)" "$timeout")
   if [[ ${seconds:-0} -gt 1200 ]]; then
     pass "kagent waits ${timeout} for a relayed tool call, longer than the relay's 20m"
@@ -349,45 +361,50 @@ check_timeout_chain() {
   fi
 }
 
-check_router_ingress() {
-  # Each kagent Session is a Substrate actor that the router reaches by a
-  # header, and the runtime trusts its caller, so only kagent's controller may
-  # reach the router. A short-lived pod elsewhere first proves it has
-  # networking, then must get no connection on any router port. The actor it
-  # names does not exist; the gate never addresses a real session.
+# check_isolation <check> <pass text> <namespace/service>... proves that a
+# short-lived pod outside every allowlist gets no connection to any port of
+# the given Services. The pod first reaches OUTSIDER_CONTROL_URL to prove it
+# has networking.
+check_isolation() {
+  local check=$1 passed=$2; shift 2
+  # Any header the router routes by names an actor that does not exist; the
+  # gate never addresses a real session.
   local actor="$KAGENT_NS/session-00000000-0000-0000-0000-000000000000"
-  # Probe the router Service as it exists, by cluster IP so no name has to
-  # resolve, so that a misnamed Service or a router that is not running
-  # cannot pass as isolation.
-  local ports ready address
-  ports=$(kubectl -n "$ROUTER_NS" get service "$ROUTER_SERVICE" -o jsonpath='{.spec.ports[*].port}' 2>/dev/null)
-  address=$(kubectl -n "$ROUTER_NS" get service "$ROUTER_SERVICE" -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
-  ready=$(kubectl -n "$ROUTER_NS" get endpointslices -l "kubernetes.io/service-name=$ROUTER_SERVICE" \
-    -o jsonpath='{range .items[*].endpoints[?(@.conditions.ready==true)]}{.addresses[0]} {end}' 2>/dev/null)
-  if [[ -z $ports || -z $ready || ! $address =~ ^[0-9a-f.:]+$ ]]; then
-    fail "router ingress" "Service $ROUTER_NS/$ROUTER_SERVICE has no ports, cluster IP, or ready router (ports: ${ports:-none}; IP: ${address:-none}; ready: ${ready:-none})"
-    return
-  fi
-  # Confirm a listener on every port through kubectl port-forward, which enters
-  # the router pod directly and so bypasses NetworkPolicy. An outsider's refused
-  # connection then means the policy refused it, not that nothing listens.
-  local silent="" port
-  for port in $ports; do
-    if ! forward "$ROUTER_NS" "svc/$ROUTER_SERVICE" "$port"; then silent="$silent $port"; continue; fi
-    curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$FORWARD_PORT/" >/dev/null 2>&1
-    sleep 0.5
-    if ! kill -0 "$FORWARD_PID" 2>/dev/null || grep -qiE 'error (occurred )?forwarding' "$WORK/forward.log"; then silent="$silent $port"; fi
-    stop_forward
+  local targets="" target namespace service ports ready address port silent
+  for target in "$@"; do
+    namespace=${target%%/*} service=${target#*/}
+    # Probe each Service as it exists, by cluster IP so no name has to
+    # resolve, so that a misnamed Service or a workload that is not running
+    # cannot pass as isolation.
+    ports=$(kubectl -n "$namespace" get service "$service" -o jsonpath='{.spec.ports[*].port}' 2>/dev/null)
+    address=$(kubectl -n "$namespace" get service "$service" -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+    ready=$(kubectl -n "$namespace" get endpointslices -l "kubernetes.io/service-name=$service" \
+      -o jsonpath='{range .items[*].endpoints[?(@.conditions.ready==true)]}{.addresses[0]} {end}' 2>/dev/null)
+    if [[ -z $ports || -z $ready || ! $address =~ ^[0-9a-f.:]+$ ]]; then
+      fail "$check" "Service $target has no ports, cluster IP, or ready endpoint (ports: ${ports:-none}; IP: ${address:-none}; ready: ${ready:-none})"
+      return
+    fi
+    # Confirm a listener on every port through kubectl port-forward, which
+    # enters the pod directly and so bypasses NetworkPolicy. An outsider's
+    # refused connection then means the policy refused it, not that nothing
+    # listens.
+    silent=""
+    for port in $ports; do
+      if ! forward "$namespace" "svc/$service" "$port"; then silent="$silent $port"; continue; fi
+      curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$FORWARD_PORT/" >/dev/null 2>&1
+      sleep 0.5
+      if ! kill -0 "$FORWARD_PID" 2>/dev/null || grep -qiE 'error (occurred )?forwarding' "$WORK/forward.log"; then silent="$silent $port"; fi
+      stop_forward
+    done
+    if [[ -n $silent ]]; then
+      fail "$check" "nothing listens on $target port(s):$silent"
+      return
+    fi
+    [[ $address == *:* ]] && address="[$address]"
+    # Plain http on every port: isolation means no TCP connection at all, so
+    # the scheme a listener expects does not matter.
+    for port in $ports; do targets="$targets http://$address:$port/"; done
   done
-  if [[ -n $silent ]]; then
-    fail "router ingress" "nothing listens on router Service port(s):$silent"
-    return
-  fi
-  [[ $address == *:* ]] && address="[$address]"
-  local targets=""
-  # Plain http on every port: isolation means no TCP connection at all, so
-  # the scheme a listener expects does not matter.
-  for port in $ports; do targets="$targets http://$address:$port/"; done
   # probe prints "<url> <http code> <curl exit> <TCP connect time>"; a connect
   # time of zero means no TCP connection was ever made.
   local script='probe() { printf "%s %s\n" "$1" "$(curl -sk -o /dev/null --connect-timeout 5 --max-time 10 -H "ate-target-actor: $ACTOR" -w "%{http_code} %{exitcode} %{time_connect}" "$1")"; }
@@ -399,7 +416,7 @@ probe "$CONTROL"; for url in $TARGETS; do probe "$url"; done'
   kubectl -n "$OUTSIDER_NS" delete pod "$OUTSIDER_POD" --ignore-not-found --wait=false >/dev/null 2>&1
   local control; control=$(printf '%s\n' "$output" | awk -v url="$OUTSIDER_CONTROL_URL" '$1 == url { print $2 }')
   if [[ ! $control =~ ^[1-5][0-9][0-9]$ ]]; then
-    fail "router ingress" "the $OUTSIDER_NS pod has no working network (control ${OUTSIDER_CONTROL_URL}: ${control:-no result}); $(tr '\n' ' ' < "$WORK/outsider.log")"
+    fail "$check" "the $OUTSIDER_NS pod has no working network (control ${OUTSIDER_CONTROL_URL}: ${control:-no result}); $(tr '\n' ' ' < "$WORK/outsider.log")"
     return
   fi
   local reached="" url line
@@ -410,9 +427,96 @@ probe "$CONTROL"; for url in $TARGETS; do probe "$url"; done'
     [[ $line =~ ^[^\ ]+\ 000\ (7|28)\ 0(\.0+)?$ ]] || reached="$reached [${line:-$url no result}]"
   done
   if [[ -z $reached ]]; then
-    pass "a pod in $OUTSIDER_NS gets no connection to Substrate's actor router on any port"
+    pass "$passed"
   else
-    fail "router ingress" "the $OUTSIDER_NS pod reached the router, or the probe proved nothing:$reached"
+    fail "$check" "the $OUTSIDER_NS pod reached a guarded Service, or the probe proved nothing:$reached"
+  fi
+}
+
+check_router_ingress() {
+  # Each kagent Session is a Substrate actor that the router reaches by a
+  # header, and the runtime trusts its caller, so only kagent's controller may
+  # reach the router.
+  check_isolation "router ingress" "a pod in $OUTSIDER_NS gets no connection to Substrate's actor router on any port" \
+    "$ROUTER_NS/$ROUTER_SERVICE"
+}
+
+check_v0_ingress() {
+  # kagent v0 trusts any caller's X-User-Id and authorizes nothing, so only
+  # its controller may reach the Agents, only the Agents and the brokers may
+  # reach the controller, and only the controller may reach its database.
+  check_isolation "v0 ingress" "a pod in $OUTSIDER_NS reaches neither the Agents, the controller, nor the database" \
+    "$KAGENT_NS/$OBSERVED_KAGENT_AGENT" "$KAGENT_NS/$GOVERNED_KAGENT_AGENT" \
+    "$KAGENT_NS/$KAGENT_CONTROLLER_SERVICE" "$KAGENT_NS/$PG_SERVICE"
+}
+
+check_compiled_settings_v0() {
+  # kagent v0 compiles each Agent into the config.json of a Secret named after
+  # it; that file is what the Agent's pod runs.
+  local relay="http://$RELAY_SERVICE.$ORKA_NS.svc:8092" compiled problems
+  compiled=$(kubectl -n "$KAGENT_NS" get secret "$GOVERNED_KAGENT_AGENT" -o jsonpath='{.data.config\.json}' 2>/dev/null | base64 -d 2>/dev/null)
+  problems=$(printf '%s' "$compiled" | jq -r --arg relay "$relay" '[
+      (if .model.api_key_passthrough != true then "no-key-passthrough" else empty end),
+      (if .model.base_url != ($relay + "/v1") then "model-not-relayed" else empty end),
+      (if (.model.api_format // "chatCompletions") != "chatCompletions" then "not-chat-completions" else empty end),
+      (if ((.http_tools // []) | length) == 0 then "no-tools" else empty end),
+      ((.http_tools // [])[] | select(.params.url != ($relay + "/mcp")) | "tool-not-relayed"),
+      ((.http_tools // [])[] | select([(.allowed_headers // [])[] | ascii_downcase] | index("authorization") | not) | "token-not-forwarded"),
+      ((.http_tools // [])[] | select(((.require_approval // []) | length) > 0) | "kagent-approval"),
+      ((.http_tools // [])[] | select((.params.headers // {}) | keys | map(ascii_downcase) | index("authorization")) | "static-authorization"),
+      (if ((.sse_tools // []) | length) > 0 then "sse-tools" else empty end),
+      (if ((.remote_agents // []) | length) > 0 then "agent-tools" else empty end),
+      (if .execute_code == true then "code-execution" else empty end),
+      (if .memory != null then "memory" else empty end),
+      (if .share_tools == true then "share-tools" else empty end)
+    ] | join(" ")' 2>/dev/null) || problems="unreadable"
+  local deploy; deploy=$(kubectl -n "$KAGENT_NS" get deploy "$GOVERNED_KAGENT_AGENT" -o json 2>/dev/null)
+  printf '%s' "$deploy" | jq -e '.spec.replicas == 1 and (.spec.template.spec.containers[0].image | test("golang-adk"))
+    and ([.spec.template.spec.containers[0].env[]?.name | select(test("^(KAGENT_SKILLS_FOLDER|KAGENT_STS_|STS_)"))] | length == 0)' >/dev/null 2>&1 ||
+    problems="$problems deployment-not-one-go-replica-without-overrides"
+  if [[ -n $compiled && -z ${problems// /} ]]; then
+    pass "the governed v0 Agent runs one Go replica that forwards the turn token to the relay and nothing else"
+  else
+    fail "compiled v0 settings" "${problems:-<no compiled config found>}"
+  fi
+}
+
+check_config_pin_v0() {
+  # Changing anything the Agent compiles from changes its pod's config hash.
+  # The wrapper must refuse the Agent until its config is pinned again.
+  local model before restore after name="$RUN-pin" phase seen restored=no
+  model=$(kubectl -n "$KAGENT_NS" get "agents.$KAGENT_GROUP" "$OBSERVED_KAGENT_AGENT" -o jsonpath='{.spec.declarative.modelConfig}')
+  before=$(kubectl -n "$KAGENT_NS" get "modelconfigs.$KAGENT_GROUP" "$model" -o json 2>/dev/null | jq -c '.spec.openAI.temperature')
+  [[ -n $model && -n $before ]] || { fail "config pin" "no ModelConfig for $OBSERVED_KAGENT_AGENT"; return; }
+  if [[ $before == null ]]; then
+    restore='[{"op":"remove","path":"/spec/openAI/temperature"}]'
+  else
+    restore="[{\"op\":\"replace\",\"path\":\"/spec/openAI/temperature\",\"value\":$before}]"
+  fi
+  agent_hash() { kubectl -n "$KAGENT_NS" get pods -l "app=kagent,kagent=$OBSERVED_KAGENT_AGENT" \
+    -o jsonpath='{range .items[*]}{.metadata.annotations.kagent\.dev/config-hash}{" "}{end}'; }
+  local pinned; pinned=$(agent_hash)
+  RESTORE="kubectl -n '$KAGENT_NS' patch 'modelconfigs.$KAGENT_GROUP' '$model' --type json -p '$restore' >/dev/null 2>&1"
+  kubectl -n "$KAGENT_NS" patch "modelconfigs.$KAGENT_GROUP" "$model" --type merge -p '{"spec":{"openAI":{"temperature":"0.42"}}}' >/dev/null
+  for _ in $(seq 1 60); do after=$(agent_hash); [[ $after =~ ^[0-9]+\ $ && $after != "$pinned" ]] && break; sleep 2; done
+  create_task "$name" "$OBSERVED_AGENT" 3m '[]'
+  phase=$(wait_terminal "$name" 40)
+  seen=$(events "$name")
+  eval "$RESTORE" && RESTORE=""
+  for _ in $(seq 1 60); do [[ $(agent_hash) == "$pinned" ]] && restored=yes && break; sleep 2; done
+  if [[ $pinned =~ ^[0-9]+\ $ && $after != "$pinned" && $phase =~ ^(Failed|TimedOut)$ && $seen != *ToolCallStarted* && $restored == yes ]]; then
+    pass "a changed v0 Agent is refused until its config is pinned again"
+  else
+    fail "config pin" "hash ${pinned:-none}-> ${after:-unchanged} phase=$phase restored=$restored events=$seen"
+  fi
+}
+
+check_sessions_retired_v0() {
+  local live; live=$(printf "select count(*) from session where user_id ~ '^orka-[0-9a-f]{40}\$' and deleted_at is null;\n" | pg)
+  if [[ $live == 0 ]]; then
+    pass "every kagent session Orka created has been deleted"
+  else
+    fail "session retirement" "${live:-<unreadable>} Orka-created kagent sessions are still live"
   fi
 }
 
@@ -428,18 +532,34 @@ check_sessions_retired() {
   fi
 }
 
-check_compiled_settings
-check_observed_turn
-check_deadline_cancel
-check_delete_cancel
-check_governed_turn
-check_approval_expiry
-check_relay_rejects_strangers
-check_control_plane_filter
-check_compiled_egress
-check_timeout_chain
-check_router_ingress
-check_sessions_retired
+if [[ $KAGENT_VERSION == v0 ]]; then
+  check_compiled_settings_v0
+  check_observed_turn
+  check_deadline_cancel
+  check_delete_cancel
+  check_governed_turn
+  # The Go runtime reuses its MCP session across turns.
+  check_governed_turn again
+  check_approval_expiry
+  check_relay_rejects_strangers
+  check_v0_ingress
+  check_timeout_chain
+  check_config_pin_v0
+  check_sessions_retired_v0
+else
+  check_compiled_settings
+  check_observed_turn
+  check_deadline_cancel
+  check_delete_cancel
+  check_governed_turn
+  check_approval_expiry
+  check_relay_rejects_strangers
+  check_control_plane_filter
+  check_compiled_egress
+  check_timeout_chain
+  check_router_ingress
+  check_sessions_retired
+fi
 
 if [[ $failures -gt 0 ]]; then
   printf '\n%d check(s) failed; this tuple is not supported.\n' "$failures"
