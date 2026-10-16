@@ -21,6 +21,13 @@ import (
 
 type acpSession struct {
 	id string
+	// mcp is the Orka session MCP server, handed to the broker in governed mode.
+	mcp *sessionMCP
+}
+
+type sessionMCP struct {
+	URL           string `json:"url"`
+	Authorization string `json:"authorization"`
 }
 
 type acpOperation struct {
@@ -267,8 +274,12 @@ func (s *acpServer) newSessionLocked(request acpRequest, _ string) {
 		return
 	}
 	// Observed mode never calls Orka's MCP server: kagent runs its own tools.
-	// The descriptor is still required so the session contract matches Orka's.
+	// Governed mode hands it to the broker, whose relay calls it for kagent.
 	s.session = &acpSession{id: acpOpaqueID("kagent-")}
+	if s.cfg.agent.Governed != nil {
+		server := params.MCPServers[0]
+		s.session.mcp = &sessionMCP{URL: server.URL, Authorization: server.Headers[0].Value}
+	}
 	s.respond(request.ID, map[string]string{"sessionId": s.session.id}, nil)
 }
 

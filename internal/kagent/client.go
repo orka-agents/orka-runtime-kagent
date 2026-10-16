@@ -167,6 +167,12 @@ func classifyRPC(err error) error {
 
 // a2aClient builds an A2A client bound to the Agent and the caller's user.
 func (c *Client) a2aClient(ctx context.Context, userID string) (*a2aclient.Client, error) {
+	return c.a2aClientWith(ctx, userID, "")
+}
+
+// a2aClientWith also sends authorization, which kagent forwards to the
+// Agent's model and MCP calls.
+func (c *Client) a2aClientWith(ctx context.Context, userID, authorization string) (*a2aclient.Client, error) {
 	transport := a2agrpc.NewGRPCTransportFromClient(c.a2a)
 	return a2aclient.NewFromEndpoints(ctx, []*a2atype.AgentInterface{{
 		URL:             c.url,
@@ -180,25 +186,29 @@ func (c *Client) a2aClient(ctx context.Context, userID string) (*a2aclient.Clien
 				return transport, nil
 			},
 		)),
-		a2aclient.WithCallInterceptors(&userInterceptor{userID: userID}),
+		a2aclient.WithCallInterceptors(&userInterceptor{userID: userID, authorization: authorization}),
 	)
 }
 
 type userInterceptor struct {
 	a2aclient.PassthroughInterceptor
-	userID string
+	userID        string
+	authorization string
 }
 
 func (i *userInterceptor) Before(ctx context.Context, request *a2aclient.Request) (context.Context, any, error) {
 	request.ServiceParams.Append(userIDHeader, i.userID)
+	if i.authorization != "" {
+		request.ServiceParams.Append("authorization", i.authorization)
+	}
 	return ctx, nil, nil
 }
 
 // Stream sends one user message into an existing conversation and yields its
 // events. The message ID is the caller's durable dispatch identity.
-func (c *Client) Stream(ctx context.Context, userID, contextID, messageID, text string) iter.Seq2[a2atype.Event, error] {
+func (c *Client) Stream(ctx context.Context, userID, contextID, messageID, text, authorization string) iter.Seq2[a2atype.Event, error] {
 	return func(yield func(a2atype.Event, error) bool) {
-		client, err := c.a2aClient(ctx, userID)
+		client, err := c.a2aClientWith(ctx, userID, authorization)
 		if err != nil {
 			yield(nil, err)
 			return

@@ -22,6 +22,11 @@ const (
 	stateDirEnv = "ORKA_KAGENT_BROKER_STATE_DIR"
 	bearerEnv   = "ORKA_KAGENT_BROKER_BEARER_TOKEN"
 	defaultAddr = "127.0.0.1:8091"
+	// Governed mode only: the relay kagent Agents call, and Orka's model
+	// credential, which the relay alone holds.
+	relayAddrEnv     = "ORKA_KAGENT_RELAY_ADDR"
+	defaultRelayAddr = ":8092"
+	upstreamTokenEnv = "ORKA_KAGENT_MODEL_UPSTREAM_TOKEN"
 )
 
 var errUsage = errors.New("usage: orka-runtime-kagent --protocol broker --config <path> [--health-check]")
@@ -59,14 +64,44 @@ func Run(args []string, getenv func(string) string) error {
 	defer client.Close() //nolint:errcheck
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
-	b, err := newLifecycleBroker(ctx, settings{
+	cfg := settings{
 		bearer: bearer, configDigest: getenv(config.ConfigDigestEnv), stateDir: stateDir, model: agent.Model,
 		expectedRevision: agent.Kagent.ExpectedRevision, userIDPrefix: agent.Kagent.UserIDPrefix,
-	}, client)
+	}
+	relayAddr := ""
+	if g := agent.Governed; g != nil {
+		token := getenv(upstreamTokenEnv)
+		base, err := config.UpstreamBaseURL(g.UpstreamBaseURL)
+		if err != nil || len(token) < 16 || strings.ContainsFunc(token, func(r rune) bool { return r <= ' ' || r == 0x7f }) {
+			return config.ErrConfig
+		}
+		cfg.governed = &governedSettings{UpstreamBaseURL: base, UpstreamModel: g.UpstreamModel, UpstreamToken: token}
+		if relayAddr = getenv(relayAddrEnv); relayAddr == "" {
+			relayAddr = defaultRelayAddr
+		}
+		if _, _, err := net.SplitHostPort(relayAddr); err != nil {
+			return config.ErrConfig
+		}
+	}
+	b, err := newLifecycleBroker(ctx, cfg, client)
 	if err != nil {
 		return err
 	}
 	defer b.close()
+	if relayAddr != "" {
+		relay := &http.Server{
+			Addr: relayAddr, Handler: b.relayHandler(),
+			// Tool calls may wait for an Orka approval, so there is no write deadline.
+			ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second,
+			MaxHeaderBytes: 32 << 10,
+		}
+		go func() { _ = relay.ListenAndServe() }()
+		defer func() {
+			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = relay.Shutdown(shutdown)
+		}()
+	}
 	server := &http.Server{
 		Addr: addr, Handler: b,
 		// Responses stream for a whole turn, so there is no write deadline.

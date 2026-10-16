@@ -48,6 +48,18 @@ type Agent struct {
 	// Model is the profile model string Orka pins. kagent owns the real model.
 	Model  string `json:"model"`
 	Kagent Kagent `json:"kagent"`
+	// Governed, when set, makes Orka execute the Agent's tools and serve its
+	// model through the broker's relay. The approved revision must point
+	// every MCP binding and model endpoint at that relay.
+	Governed *Governed `json:"governed,omitempty"`
+}
+
+// Governed names the model endpoint the relay calls with Orka's credential.
+type Governed struct {
+	// UpstreamBaseURL is an OpenAI-compatible base URL, such as ".../v1".
+	UpstreamBaseURL string `json:"upstreamBaseURL"`
+	// UpstreamModel replaces whatever model the kagent Agent asks for.
+	UpstreamModel string `json:"upstreamModel"`
 }
 
 // Kagent identifies the kagent control plane and the exact Agent revision.
@@ -102,7 +114,25 @@ func Decode(data []byte, digest, model string) (Agent, error) {
 		!revision.MatchString(k.ExpectedRevision) || !userIDPrefix.MatchString(k.UserIDPrefix) {
 		return Agent{}, ErrConfig
 	}
+	if g := agent.Governed; g != nil {
+		if _, err := UpstreamBaseURL(g.UpstreamBaseURL); err != nil || !SafeString(g.UpstreamModel, 256) ||
+			strings.TrimSpace(g.UpstreamModel) != g.UpstreamModel {
+			return Agent{}, ErrConfig
+		}
+	}
 	return agent, nil
+}
+
+// UpstreamBaseURL validates an http(s) base URL that may carry a path but no
+// credentials, query, or fragment. Its trailing slash is removed.
+func UpstreamBaseURL(value string) (string, error) {
+	u, err := url.Parse(value)
+	if err != nil || !SafeString(value, 2048) || strings.TrimSpace(value) != value || u == nil ||
+		(u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" ||
+		u.ForceQuery || u.Fragment != "" || strings.Contains(value, "#") || u.RawPath != "" {
+		return "", ErrConfig
+	}
+	return strings.TrimSuffix(value, "/"), nil
 }
 
 // ControlPlaneURL validates the kagent controller base URL: plain http(s) with

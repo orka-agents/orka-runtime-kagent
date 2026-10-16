@@ -51,8 +51,9 @@ One image provides both processes:
   with `kagent_session_gone`.
 - **Proven retirement.** Retirement is reported only after `DeleteSession`
   succeeds and `GetSession` returns NotFound.
-- **Observed tools only.** kagent runs its own tools. Orka sees each tool's
-  name and status, never its arguments or results. An `input-required` or
+- **Observed tools by default.** In observed mode kagent runs its own tools.
+  Orka sees each tool's name and status, never its arguments or results.
+  [Governed mode](#governed-mode) moves tools and the model under Orka. An `input-required` or
   `auth-required` pause cancels the kagent task and fails the turn, because a
   wrapped agent cannot answer kagent approval prompts.
 
@@ -65,6 +66,79 @@ the wrapped kagent Agent:
 
 The operator must attest that the Agent has no tool able to publish to source
 control directly.
+
+## Governed mode
+
+In governed mode, Orka executes the Agent's tools and serves its model. The
+`governed` section of `kagent.json` turns it on:
+
+```json
+"governed": {
+  "upstreamBaseURL": "http://<orka model endpoint>/v1",
+  "upstreamModel": "<model to call>"
+}
+```
+
+The broker then opens a relay (`ORKA_KAGENT_RELAY_ADDR`, default `:8092`) for
+kagent to call:
+
+- `/mcp` forwards MCP tool calls to the turn's Orka session MCP server. Orka's
+  policy, approvals, credentials, and audit apply to every call.
+- `/v1/chat/completions` forwards model calls to `upstreamBaseURL`. It pins
+  `upstreamModel`, adds Orka's credential (`ORKA_KAGENT_MODEL_UPSTREAM_TOKEN`),
+  and totals token usage for Orka.
+
+### Turn tokens
+
+For each turn the broker mints a random token and sends it as the A2A
+caller's bearer. kagent forwards that bearer to the Agent's model and MCP
+calls. The relay accepts a token only while its turn is live and only for that
+turn's kagent user. Tokens exist only in memory and die with the turn.
+
+### What the kagent side must look like
+
+The import step checks this before it pins `expectedRevision`. The revision
+digest then keeps it fixed.
+
+- The kagent controller runs with `tokenPropagation.enabled` and the ADK
+  harness with `skillTools.disableBash`. Memory is off.
+- Every model is a `ModelConfig` with provider `OpenAI`, `baseUrl` set to the
+  relay's `/v1`, and `apiKeyPassthrough: true`.
+- Every tool comes from one `RemoteMCPServer`:
+  - its URL is the relay's `/mcp`;
+  - its protocol is `STREAMABLE_HTTP`;
+  - its `timeout` is at least `20m`;
+  - it carries the `kagent.dev/discovery=disabled` label, because the relay
+    answers only turn-scoped callers.
+- The revision's egress list names only the relay and the control-plane
+  filter. kagent also always allows its provider's default host, which is an
+  accepted risk.
+- A NetworkPolicy lets only the kagent Agent pods reach the relay.
+
+On the Orka side, render the profile with the Orka tools the Agent may call
+(`--allowed-tools`, `--approval-required-tools`).
+
+### Timeouts
+
+The timeouts nest:
+
+1. Orka holds an approval-gated call for up to 900 seconds.
+2. The relay waits up to 20 minutes.
+3. The `RemoteMCPServer` timeout must be longer still.
+4. The turn's lease outlives all of these.
+
+### Audit
+
+Orka's tool broker records every governed call; that record is authoritative.
+The `response.kagent_tool.*` events Orka shows for kagent's own tool activity
+are observations.
+
+### Retries
+
+A tool call's Orka operation ID comes from the turn, the relay's MCP session,
+and kagent's request ID. A retried request therefore never runs twice. If
+kagent re-issues a call on a new MCP session, Orka sees it as a new operation.
+That can happen after a sandbox crash.
 
 ## Supervisor restart recovery
 
@@ -133,6 +207,8 @@ its SHA-256 against `ORKA_KAGENT_ACP_AGENT_CONFIGURATION_DIGEST`.
 | broker | `ORKA_KAGENT_BROKER_ADDR` | Loopback listen address, default `127.0.0.1:8091` |
 | broker | `ORKA_KAGENT_BROKER_STATE_DIR` | Absolute path on a broker-only persistent volume |
 | broker | `ORKA_KAGENT_BROKER_BEARER_TOKEN` | At least 32 bytes; shared only with the supervisor's provider token file |
+| broker, governed | `ORKA_KAGENT_RELAY_ADDR` | Relay listen address, default `:8092` |
+| broker, governed | `ORKA_KAGENT_MODEL_UPSTREAM_TOKEN` | Orka's credential for `upstreamBaseURL`; broker only |
 
 The supervisor runs with `ORKA_ACP_PROVIDER=kagent` and with
 `ORKA_ACP_PROVIDER_PROXY_BASE_URL=http://127.0.0.1:8091/v1`. Its provider token
@@ -170,8 +246,9 @@ make docker-build-acp-kagent-runtime \
   - Retired sessions are pruned 24 hours after retirement.
   - A ledger holds at most 4096 live sessions.
   - Each session holds at most 4096 prompts.
-- **One request per prompt.** Each prompt sends a single request; brokered Orka
-  tools are not wired yet.
+- **One request per prompt.** Each prompt sends a single request to the broker.
+- **Claude and Codex harnesses are observed only.** They reject
+  `apiKeyPassthrough`, so the relay cannot tell which session is calling.
 - **kagent prerelease constraints apply:**
   - task-store identity is an unsigned header until Substrate #1660;
   - idle kagent Sessions expire after seven days by default.

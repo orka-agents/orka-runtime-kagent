@@ -45,7 +45,7 @@ type remote interface {
 	CreateSession(ctx context.Context, userID, requestID string) (kagent.Session, error)
 	GetSession(ctx context.Context, userID, id string) (kagent.Session, error)
 	DeleteSession(ctx context.Context, userID, id string) error
-	Stream(ctx context.Context, userID, contextID, messageID, text string) iter.Seq2[a2atype.Event, error]
+	Stream(ctx context.Context, userID, contextID, messageID, text, authorization string) iter.Seq2[a2atype.Event, error]
 	GetTask(ctx context.Context, userID string, taskID a2atype.TaskID) (*a2atype.Task, error)
 	FindTaskByMessage(ctx context.Context, userID, contextID, messageID string) (*a2atype.Task, error)
 	CancelTask(ctx context.Context, userID string, taskID a2atype.TaskID) (*a2atype.Task, error)
@@ -64,6 +64,12 @@ type settings struct {
 	retiredRetention time.Duration
 	now              func() time.Time
 	log              *slog.Logger
+	// governed is set when Orka executes the Agent's tools and serves its model.
+	governed *governedSettings
+}
+
+type governedSettings struct {
+	UpstreamBaseURL, UpstreamModel, UpstreamToken string
 }
 
 type active struct {
@@ -86,6 +92,12 @@ type lifecycleBroker struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// Turn tokens authorize relayed calls; they live only in memory.
+	turnMu      sync.Mutex
+	turns       map[string]*turnBinding
+	relaySlots  chan struct{}
+	relayClient *http.Client
 }
 
 func newLifecycleBroker(ctx context.Context, cfg settings, r remote) (*lifecycleBroker, error) {
@@ -116,7 +128,11 @@ func newLifecycleBroker(ctx context.Context, cfg settings, r remote) (*lifecycle
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	b := &lifecycleBroker{cfg: cfg, remote: r, store: s, ledger: l, active: map[string]active{},
-		workers: map[string]bool{}, nextReconcile: map[string]time.Time{}, ctx: ctx, cancel: cancel}
+		workers: map[string]bool{}, nextReconcile: map[string]time.Time{}, ctx: ctx, cancel: cancel,
+		turns: map[string]*turnBinding{}, relaySlots: make(chan struct{}, maxRelayInflight), relayClient: &http.Client{
+			// Never follow a redirect with Orka's credential attached.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}}
 	// A restarted broker never resumes an old request. Recovery closes each
 	// unsettled prompt and obtains kagent evidence before settling it.
 	now := cfg.now()

@@ -36,14 +36,19 @@ type peer struct {
 
 func newPeer(t *testing.T, provider http.HandlerFunc, mcpURL string) *peer {
 	t.Helper()
+	return newPeerWithConfig(t, provider, mcpURL, testConfig)
+}
+
+func newPeerWithConfig(t *testing.T, provider http.HandlerFunc, mcpURL, agentConfig string) *peer {
+	t.Helper()
 	server := httptest.NewServer(provider)
 	t.Cleanup(server.Close)
 	path := filepath.Join(t.TempDir(), "kagent.json")
-	if err := os.WriteFile(path, []byte(testConfig), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(agentConfig), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	env := map[string]string{
-		config.ModelEnv: testModel, config.ConfigDigestEnv: config.Digest([]byte(testConfig)),
+		config.ModelEnv: testModel, config.ConfigDigestEnv: config.Digest([]byte(agentConfig)),
 		providerBaseEnv: server.URL + "/_orka/provider/route/v1", providerTokenEnv: testToken,
 	}
 	cfg, err := loadConfiguration(path, func(key string) string { return env[key] })
@@ -256,5 +261,23 @@ func TestSessionRequiresOrkaLoopbackMCPDescriptor(t *testing.T) {
 	p := newPeer(t, func(http.ResponseWriter, *http.Request) {}, "http://example.com/mcp")
 	if p.session != "" {
 		t.Fatal("non-loopback MCP descriptor was accepted")
+	}
+}
+
+func TestGovernedPromptHandsTheOrkaMCPServerToTheBroker(t *testing.T) {
+	var body map[string]any
+	governed := strings.Replace(testConfig, `"kagent":{`, `"governed":{"upstreamBaseURL":"http://model.orka.svc:8080/v1","upstreamModel":"gpt-test"},"kagent":{`, 1)
+	p := newPeerWithConfig(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sse(w, created, `{"type":"response.output_text.delta","delta":"done"}`,
+			`{"type":"response.completed","response":{"id":"kr_1","status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}`)
+	}, "http://127.0.0.1:9/_orka/mcp/route", governed)
+	response := p.reply(p.prompt("hello"))
+	if response["result"].(map[string]any)["stopReason"] != "end_turn" {
+		t.Fatalf("prompt = %v", response)
+	}
+	mcp, _ := body["mcp"].(map[string]any)
+	if mcp["url"] != "http://127.0.0.1:9/_orka/mcp/route" || mcp["authorization"] != "Bearer mcp-token" {
+		t.Fatalf("governed request body = %v", body)
 	}
 }

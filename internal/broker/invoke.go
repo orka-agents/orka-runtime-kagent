@@ -38,6 +38,8 @@ type responseRequest struct {
 	Input  string `json:"input"`
 	Stream bool   `json:"stream"`
 	Store  bool   `json:"store"`
+	// MCP is the Orka session MCP server, sent only in governed mode.
+	MCP *relayMCP `json:"mcp,omitempty"`
 }
 
 // Failure codes are fixed strings; kagent error text is never relayed.
@@ -52,7 +54,8 @@ const (
 func (b *lifecycleBroker) serveResponses(w http.ResponseWriter, r *http.Request, c brokerContext, raw []byte) {
 	var request responseRequest
 	if strictjson.Decode(raw, &request, true) != nil || request.Model != b.cfg.model || !request.Stream || !request.Store ||
-		request.Input == "" || !utf8.ValidString(request.Input) {
+		request.Input == "" || !utf8.ValidString(request.Input) || (b.cfg.governed != nil) != (request.MCP != nil) ||
+		(request.MCP != nil && !request.MCP.valid()) {
 		writeError(w, errInvalid)
 		return
 	}
@@ -96,9 +99,23 @@ func (b *lifecycleBroker) serveResponses(w http.ResponseWriter, r *http.Request,
 		b.finish(key, promptKey, c.InvocationSequence, nil)
 		return
 	}
+	authorization, turn := "", (*turnBinding)(nil)
+	if request.MCP != nil {
+		token, digest, err := newTurnToken()
+		if err != nil {
+			b.finish(key, promptKey, c.InvocationSequence, nil)
+			return
+		}
+		turn = newTurnBinding(promptKey, s.UserID, runCtx, *request.MCP)
+		b.bindTurn(digest, turn)
+		defer b.unbindTurn(digest)
+		authorization = "Bearer " + token
+	}
 	stopKeepalive := stream.keepalive(runCtx, b.cfg.keepalive)
-	outcome := b.runTurn(runCtx, s, key, promptKey, c.InvocationSequence, messageID, request.Input, stream)
+	outcome := b.runTurn(runCtx, s, key, promptKey, c.InvocationSequence, messageID, request.Input, authorization, stream)
 	stopKeepalive()
+	// The token dies with the turn, before its result is reported.
+	cancel()
 	b.finish(key, promptKey, c.InvocationSequence, &outcome.invocation)
 	if outcome.failure != "" {
 		_ = stream.event("response.failed", map[string]any{"type": "response.failed", "response": map[string]any{
@@ -116,7 +133,17 @@ func (b *lifecycleBroker) serveResponses(w http.ResponseWriter, r *http.Request,
 		}
 		text = text[n:]
 	}
-	_ = stream.event("response.completed", map[string]any{"type": "response.completed", "response": map[string]string{"id": responseID, "status": "completed"}})
+	completed := map[string]any{"id": responseID, "status": "completed"}
+	if turn != nil {
+		if usage := turn.totalUsage(); usage.reported {
+			reported := map[string]any{"input_tokens": usage.Input, "output_tokens": usage.Output}
+			if usage.cached {
+				reported["input_tokens_details"] = map[string]uint64{"cached_tokens": usage.Cached}
+			}
+			completed["usage"] = reported
+		}
+	}
+	_ = stream.event("response.completed", map[string]any{"type": "response.completed", "response": completed})
 }
 
 type turnOutcome struct {
@@ -127,7 +154,7 @@ type turnOutcome struct {
 
 // runTurn sends the message once (retrying only kagent's explicit
 // not-accepted proof), relays tool activity, and resolves a terminal task.
-func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKey string, sequence uint64, messageID, text string, stream *sse) turnOutcome {
+func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKey string, sequence uint64, messageID, text, authorization string, stream *sse) turnOutcome {
 	out := turnOutcome{invocation: invocation{State: invocationIntent, MessageID: messageID}}
 	tools := newToolRelay(stream)
 	var taskID a2atype.TaskID
@@ -141,7 +168,7 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 			return out
 		}
 		notAccepted := false
-		for event, err := range b.remote.Stream(ctx, s.UserID, s.RemoteID, messageID, text) {
+		for event, err := range b.remote.Stream(ctx, s.UserID, s.RemoteID, messageID, text, authorization) {
 			if err != nil {
 				notAccepted = taskID == "" && kagent.NotAccepted(err)
 				break

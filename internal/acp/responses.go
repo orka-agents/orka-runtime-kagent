@@ -41,6 +41,8 @@ type streamEvent struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error,omitempty"`
+		// Usage is read by the Orka supervisor, not by the child.
+		Usage json.RawMessage `json:"usage,omitempty"`
 	} `json:"response,omitempty"`
 	Tool *struct {
 		ID     string `json:"id"`
@@ -52,7 +54,11 @@ type streamEvent struct {
 // runPrompt sends one prompt through the supervisor proxy to the broker and
 // relays the resulting stream as ACP session updates.
 func (s *acpServer) runPrompt(ctx context.Context, session *acpSession, text string) error {
-	body, err := json.Marshal(map[string]any{"model": s.cfg.agent.Model, "input": text, "stream": true, "store": true})
+	payload := map[string]any{"model": s.cfg.agent.Model, "input": text, "stream": true, "store": true}
+	if session.mcp != nil {
+		payload["mcp"] = session.mcp
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}

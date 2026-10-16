@@ -57,6 +57,13 @@ type fakeRemote struct {
 	calls     []string
 	findErr   error
 	onFind    func() // runs during a task lookup
+	auth      string // the authorization of the latest stream
+}
+
+func (f *fakeRemote) lastAuthorization() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.auth
 }
 
 func newFakeRemote() *fakeRemote {
@@ -152,9 +159,10 @@ func (f *fakeRemote) DeleteSession(_ context.Context, userID, id string) error {
 	return nil
 }
 
-func (f *fakeRemote) Stream(ctx context.Context, _, contextID, messageID, _ string) iter.Seq2[a2atype.Event, error] {
+func (f *fakeRemote) Stream(ctx context.Context, _, contextID, messageID, _, authorization string) iter.Seq2[a2atype.Event, error] {
 	f.record("stream " + messageID)
 	f.mu.Lock()
+	f.auth = authorization
 	var script func(context.Context, string, string) []item
 	if len(f.streams) > 0 {
 		script, f.streams = f.streams[0], f.streams[1:]
@@ -246,6 +254,8 @@ type harness struct {
 	mu     sync.Mutex
 	clock  time.Time
 	logs   lockedBuffer
+	// governed, when set, opens the broker in governed mode.
+	governed *governedSettings
 }
 
 type lockedBuffer struct {
@@ -289,7 +299,7 @@ func (h *harness) open() {
 	b, err := newLifecycleBroker(context.Background(), settings{
 		bearer: testBearer, configDigest: h.digest, stateDir: h.dir, model: testModel,
 		expectedRevision: testRevision, userIDPrefix: "orka", operationTimeout: 5 * time.Second,
-		keepalive: 50 * time.Millisecond, now: h.now, log: slog.New(slog.NewJSONHandler(&h.logs, nil)),
+		keepalive: 50 * time.Millisecond, now: h.now, log: slog.New(slog.NewJSONHandler(&h.logs, nil)), governed: h.governed,
 	}, h.remote)
 	if err != nil {
 		h.t.Fatal(err)

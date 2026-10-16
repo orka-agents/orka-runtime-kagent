@@ -35,6 +35,12 @@ func TestDecodeVerifiesDigestModelAndFields(t *testing.T) {
 		"bad namespace":      func(s string) string { return strings.Replace(s, `"namespace":"kagent"`, `"namespace":"Kagent"`, 1) },
 		"bad user prefix":    func(s string) string { return strings.Replace(s, `"orka"`, `"Orka!"`, 1) },
 		"credentials in url": func(s string) string { return strings.Replace(s, "http://", "http://user:pass@", 1) },
+		"governed without model": func(s string) string {
+			return strings.Replace(s, `"kagent":{`, `"governed":{"upstreamBaseURL":"http://model.orka.svc/v1","upstreamModel":""},"kagent":{`, 1)
+		},
+		"governed upstream query": func(s string) string {
+			return strings.Replace(s, `"kagent":{`, `"governed":{"upstreamBaseURL":"http://model.orka.svc/v1?x=1","upstreamModel":"m"},"kagent":{`, 1)
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			changed := []byte(mutate(validConfig))
@@ -60,5 +66,16 @@ func TestLoadBoundsAndVerifiesFile(t *testing.T) {
 	}
 	if _, _, err := Load(large, Digest(make([]byte, MaxConfigBytes+1)), "x"); err == nil {
 		t.Fatal("oversized configuration accepted")
+	}
+}
+
+func TestDecodeAcceptsGovernedUpstream(t *testing.T) {
+	data := []byte(strings.Replace(validConfig, `"kagent":{`, `"governed":{"upstreamBaseURL":"http://model.orka.svc:8080/v1/","upstreamModel":"gpt-test"},"kagent":{`, 1))
+	agent, err := Decode(data, Digest(data), "kagent/kagent/probe")
+	if err != nil || agent.Governed == nil || agent.Governed.UpstreamModel != "gpt-test" {
+		t.Fatalf("governed config = %#v %v", agent.Governed, err)
+	}
+	if base, err := UpstreamBaseURL(agent.Governed.UpstreamBaseURL); err != nil || base != "http://model.orka.svc:8080/v1" {
+		t.Fatalf("upstream base = %q %v", base, err)
 	}
 }
