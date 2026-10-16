@@ -199,7 +199,10 @@ func (b *lifecycleBroker) resolveInvocation(ctx context.Context, s *session, inv
 		// kagent v0 records a cancellation before its execution has unwound,
 		// so a canceled v0 task is cancelled again: the call returns only once
 		// no execution of it is left. kagent v0 writes completed and failed
-		// only as its executor's final statement, so those need no call.
+		// only as its executor's final statement, so those need no call;
+		// a2a-go's own failed status, written when processing an event fails,
+		// is followed by cancelling the execution's context, which aborts
+		// kagent's in-flight model and MCP calls.
 		task, err = b.remote.CancelTask(ctx, s.UserID, a2atype.TaskID(inv.TaskID))
 	}
 	if err != nil || task == nil || !task.Status.State.Terminal() {

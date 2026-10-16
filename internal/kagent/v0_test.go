@@ -24,6 +24,24 @@ type fixedPin struct {
 func (p fixedPin) ConfigHash(context.Context) (string, error) { return p.hash, p.err }
 func (p fixedPin) PodUIDs(context.Context) ([]string, error)  { return []string{"pod-a"}, p.err }
 
+// rollingPin reports one pod until its first PodUIDs call, then a new one, as
+// if a rollout replaced the pod during a cancel.
+type rollingPin struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (p *rollingPin) ConfigHash(context.Context) (string, error) { return "42", nil }
+func (p *rollingPin) PodUIDs(context.Context) ([]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	if p.calls == 1 {
+		return []string{"pod-a"}, nil
+	}
+	return []string{"pod-b"}, nil
+}
+
 // fakeV0Controller answers the kagent v0.10 controller routes the client uses.
 type fakeV0Controller struct {
 	mu       sync.Mutex
@@ -215,5 +233,13 @@ func TestV0CancelProvesNoExecutionIsLeft(t *testing.T) {
 	client.pin = fixedPin{err: ErrRollout}
 	if _, err := client.CancelTask(context.Background(), "orka-user", "task-1"); !errors.Is(err, ErrRollout) {
 		t.Fatalf("a cancel during a rollout = %v, want ErrRollout", err)
+	}
+}
+
+func TestV0CancelIsProofOnlyIfThePodStayedTheSame(t *testing.T) {
+	client, _ := newV0Test(t)
+	client.pin = &rollingPin{}
+	if _, err := client.CancelTask(context.Background(), "orka-user", "task-1"); !errors.Is(err, ErrRollout) {
+		t.Fatalf("a cancel across a pod change = %v, want ErrRollout", err)
 	}
 }

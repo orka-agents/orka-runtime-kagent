@@ -159,14 +159,40 @@ func (c *V0Client) AgentPodUIDs(ctx context.Context) ([]string, error) { return 
 // cannot relay the Agent's refusal to cancel one; it answers an internal
 // error. A refusal that does arrive is answered with the task itself.
 func (c *V0Client) CancelTask(ctx context.Context, userID string, taskID a2atype.TaskID) (*a2atype.Task, error) {
-	if _, err := c.pin.ConfigHash(ctx); err != nil {
+	// The proof holds only if the cancel reached the pod that could be
+	// running the task, so the same single pod must exist before and after
+	// the call. A rollout that starts in between could route the cancel to a
+	// new pod with nothing to join while the old pod still runs the task.
+	pod, err := c.onlyPod(ctx)
+	if err != nil {
 		return nil, err
 	}
 	task, err := c.a2aAccess.CancelTask(ctx, userID, taskID)
 	if errors.Is(err, a2atype.ErrTaskNotCancelable) {
-		return c.GetTask(ctx, userID, taskID)
+		task, err = c.GetTask(ctx, userID, taskID)
 	}
-	return task, err
+	if err != nil {
+		return task, err
+	}
+	if after, err := c.onlyPod(ctx); err != nil || after != pod {
+		return nil, ErrRollout
+	}
+	return task, nil
+}
+
+// onlyPod returns the UID of the Agent's only pod, which must be ready.
+func (c *V0Client) onlyPod(ctx context.Context) (string, error) {
+	if _, err := c.pin.ConfigHash(ctx); err != nil {
+		return "", err
+	}
+	uids, err := c.pin.PodUIDs(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(uids) != 1 {
+		return "", ErrRollout
+	}
+	return uids[0], nil
 }
 
 // DeleteSession marks the session deleted. v0 only marks the row: the Agent
