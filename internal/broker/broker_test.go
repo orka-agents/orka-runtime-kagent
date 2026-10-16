@@ -953,6 +953,49 @@ func TestDisconnectedPromptQuarantinesWithoutASettleCall(t *testing.T) {
 	eventually(t, "quarantine after a disconnect", func() bool { return strings.Contains(h.logs.String(), "kagent session quarantined") })
 }
 
+func TestQuarantineEndsWhenCleanupIsProven(t *testing.T) {
+	remote := newFakeRemote()
+	started := make(chan struct{})
+	remote.streams = append(remote.streams, func(ctx context.Context, contextID, messageID string) []item {
+		remote.setTask(&a2atype.Task{ID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking}}, messageID)
+		remote.mu.Lock()
+		remote.stuck["task-1"] = true
+		remote.mu.Unlock()
+		close(started)
+		<-ctx.Done()
+		return []item{{err: ctx.Err()}}
+	}, completedStream(remote, "task-2", "ok"))
+	h := newHarness(t, remote)
+	o, p := testOwner(1), h.prompt("prompt-1")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		body := turnBody()
+		h.request(context.Background(), responsesPath, h.header(responsesPath, o, p, 1, body), body)
+	}()
+	<-started
+	h.controlOnce(settlePath, o, p)
+	<-done
+	h.advance(defaultCleanupDeadline + time.Second)
+	eventually(t, "quarantine", func() bool {
+		_, response := h.controlOnce(settlePath, o, p)
+		return response.State == "quarantined"
+	})
+	// kagent finally lets the task stop: cleanup proves it and the session
+	// takes prompts again.
+	remote.mu.Lock()
+	remote.stuck["task-1"] = false
+	remote.mu.Unlock()
+	h.advance(quarantineBackoff + time.Second)
+	eventually(t, "settlement", func() bool {
+		_, response := h.controlOnce(settlePath, o, p)
+		return response.SettlementProven
+	})
+	if code := h.turn(o, h.prompt("prompt-2")).Code; code != http.StatusOK {
+		t.Fatalf("a session whose cleanup was proven refused a prompt: %d", code)
+	}
+}
+
 func TestRetiredRecordsArePrunedAfterRetention(t *testing.T) {
 	remote := newFakeRemote()
 	remote.streams = append(remote.streams, completedStream(remote, "task-1", "ok"))

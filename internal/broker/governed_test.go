@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -53,9 +54,10 @@ func (f *fakeOrkaMCP) snapshot() ([]map[string]any, []string) {
 
 // fakeModel stands in for Orka's OpenAI-compatible model endpoint.
 type fakeModel struct {
-	mu     sync.Mutex
-	bodies []map[string]any
-	auth   []string
+	mu      sync.Mutex
+	bodies  []map[string]any
+	auth    []string
+	holdEOF bool // keep the body open after [DONE] until the request ends
 }
 
 func (f *fakeModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -64,11 +66,16 @@ func (f *fakeModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.bodies = append(f.bodies, body)
 	f.auth = append(f.auth, r.Header.Get("Authorization"))
+	hold := f.holdEOF
 	f.mu.Unlock()
 	w.Header().Set("Content-Type", "text/event-stream")
 	_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"+
 		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":8,\"prompt_tokens_details\":{\"cached_tokens\":10}}}\n\n"+
 		"data: [DONE]\n\n")
+	if hold {
+		http.NewResponseController(w).Flush() //nolint:errcheck
+		<-r.Context().Done()
+	}
 }
 
 type governedHarness struct {
@@ -357,5 +364,49 @@ func TestRelayCopyReportsTruncatedUpstreamBodies(t *testing.T) {
 	recorder = httptest.NewRecorder()
 	if _, err := relayCopy(recorder, endlessLines{}, true); !errors.Is(err, errRelayResponseTooLarge) || recorder.Body.Len() > relayMaxResponse {
 		t.Fatalf("oversized body: err %v after forwarding %d bytes", err, recorder.Body.Len())
+	}
+}
+
+// kagent can finish a turn as soon as it reads [DONE], while the relay still
+// waits for the upstream body to end. The turn must still count that call.
+func TestTurnCountsUsageOfAModelCallOpenAtItsEnd(t *testing.T) {
+	remote := newFakeRemote()
+	var relayURL string
+	var open []io.Closer
+	t.Cleanup(func() {
+		for _, body := range open {
+			_ = body.Close()
+		}
+	})
+	remote.streams = append(remote.streams, func(_ context.Context, contextID, messageID string) []item {
+		request, _ := http.NewRequest(http.MethodPost, relayURL+"/v1/chat/completions",
+			strings.NewReader(`{"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+		request.Header.Set("Authorization", remote.lastAuthorization())
+		if response, err := http.DefaultClient.Do(request); err == nil {
+			open = append(open, response.Body)
+			for reader := bufio.NewReader(response.Body); ; {
+				line, err := reader.ReadString('\n')
+				if strings.Contains(line, "[DONE]") || err != nil {
+					break
+				}
+			}
+		}
+		return completedStream(remote, "task-1", "done")(context.Background(), contextID, messageID)
+	})
+	g := newGovernedHarness(t, remote)
+	g.model.mu.Lock()
+	g.model.holdEOF = true
+	g.model.mu.Unlock()
+	server := httptest.NewServer(g.b.relayHandler())
+	t.Cleanup(server.Close)
+	relayURL = server.URL
+	recorder := g.governedTurn(testOwner(1), g.prompt("prompt-1"))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("governed turn = %d %s", recorder.Code, recorder.Body.String())
+	}
+	events := parseSSE(t, recorder.Body.String())
+	usage, _ := events[len(events)-1].data["response"].(map[string]any)["usage"].(map[string]any)
+	if usage["input_tokens"] != float64(40) || usage["output_tokens"] != float64(8) {
+		t.Fatalf("reported usage = %v", usage)
 	}
 }

@@ -119,8 +119,12 @@ func (b *lifecycleBroker) serveResponses(w http.ResponseWriter, r *http.Request,
 	stopKeepalive := stream.keepalive(runCtx, b.cfg.keepalive)
 	outcome := b.runTurn(runCtx, s, key, promptKey, c.InvocationSequence, messageID, request.Input, authorization, stream)
 	stopKeepalive()
-	// The token dies with the turn, before its result is reported.
+	// The token dies with the turn, before its result is reported. Ending the
+	// turn also ends its relay calls; wait for them so their usage counts.
 	cancel()
+	if turn != nil {
+		turn.drain(relayDrainLimit)
+	}
 	b.finish(key, promptKey, c.InvocationSequence, &outcome.invocation)
 	if outcome.failure != "" {
 		_ = stream.event("response.failed", map[string]any{"type": "response.failed", "response": map[string]any{

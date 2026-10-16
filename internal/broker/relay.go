@@ -39,7 +39,10 @@ const (
 	maxTurnRelayInflight = 8
 	// A downstream write that stalls this long fails; the turn's end fails
 	// it at once. Approval waits happen before any write.
-	relayWriteStall  = 30 * time.Second
+	relayWriteStall = 30 * time.Second
+	// Ending a turn cancels its relay calls, so draining them is quick; the
+	// limit only stops a stuck call from holding the turn's result.
+	relayDrainLimit  = 5 * time.Second
 	turnTokenBytes   = 32
 	mcpSessionHeader = "Mcp-Session-Id"
 	userIDHeader     = "X-User-Id"
@@ -62,6 +65,11 @@ type turnBinding struct {
 	mu       sync.Mutex
 	sessions map[string]bool
 	usage    tokenUsage
+
+	// calls tracks admitted relay requests. Once drained is set no request is
+	// admitted, so the turn can wait for the rest before reading usage.
+	calls   sync.WaitGroup
+	drained bool
 }
 
 func newTurnBinding(promptKey, userID string, ctx context.Context, mcp relayMCP) *turnBinding {
@@ -82,7 +90,31 @@ func (b *lifecycleBroker) admitRelay(turn *turnBinding) (func(), bool) {
 		<-turn.slots
 		return nil, false
 	}
-	return func() { <-b.relaySlots; <-turn.slots }, true
+	turn.mu.Lock()
+	if turn.drained {
+		turn.mu.Unlock()
+		<-b.relaySlots
+		<-turn.slots
+		return nil, false
+	}
+	turn.calls.Add(1)
+	turn.mu.Unlock()
+	return func() { turn.calls.Done(); <-b.relaySlots; <-turn.slots }, true
+}
+
+// drain stops admitting relay requests and waits, at most limit, for the
+// admitted ones to finish. A model call can deliver its last chunk to kagent
+// before the relay records its usage, so the turn drains before it reports.
+func (t *turnBinding) drain(limit time.Duration) {
+	t.mu.Lock()
+	t.drained = true
+	t.mu.Unlock()
+	done := make(chan struct{})
+	go func() { t.calls.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(limit):
+	}
 }
 
 // relayWriter bounds every downstream write and fails a blocked one as soon

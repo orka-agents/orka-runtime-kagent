@@ -233,6 +233,15 @@ func (b *lifecycleBroker) applyInvocations(key, promptKey string, updates map[ui
 		}
 		p.Settled, p.ProofDigest = true, proof
 		s.RemoteGone = s.RemoteGone || gone
+		// Quarantine ends once cleanup has proven every prompt. A deleted
+		// session stays unusable through RemoteGone.
+		unproven := false
+		for _, other := range s.Prompts {
+			unproven = unproven || (other.Closing && !other.Settled)
+		}
+		if !unproven {
+			s.QuarantinedAt = time.Time{}
+		}
 		return nil
 	}) == nil && proof != ""
 }
