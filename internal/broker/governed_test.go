@@ -203,31 +203,46 @@ func TestGovernedModeRequiresTheOrkaMCPServer(t *testing.T) {
 	}
 }
 
-func TestRelayRequiresAnOpenMCPSession(t *testing.T) {
+// kagent's Go runtime keeps one MCP session per process and reuses it across
+// turns, so a session opened in one turn must work in the next, under that
+// turn's own token. Requests without a well-formed session are refused.
+func TestRelayMCPSessionsCarryNoAuthority(t *testing.T) {
 	remote := newFakeRemote()
 	var g *governedHarness
 	codes := map[string]int{}
+	var session string
+	call := map[string]any{"jsonrpc": "2.0", "id": "a", "method": "tools/call", "params": map[string]any{"name": "create-work-order"}}
 	remote.streams = append(remote.streams, func(_ context.Context, contextID, messageID string) []item {
 		bearer := remote.lastAuthorization()
-		call := map[string]any{"jsonrpc": "2.0", "id": "a", "method": "tools/call", "params": map[string]any{"name": "create-work-order"}}
 		codes["no session"] = g.relay(http.MethodPost, "/mcp", bearer, "", call).Code
+		codes["malformed session"] = g.relay(http.MethodPost, "/mcp", bearer, "not-a-session", call).Code
 		codes["stream"] = g.relay(http.MethodGet, "/mcp", bearer, "", nil).Code
-		session := g.relay(http.MethodPost, "/mcp", bearer, "", map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize"}).Header().Get(mcpSessionHeader)
-		codes["open"] = g.relay(http.MethodPost, "/mcp", bearer, session, call).Code
-		codes["close"] = g.relay(http.MethodDelete, "/mcp", bearer, session, nil).Code
-		codes["closed"] = g.relay(http.MethodPost, "/mcp", bearer, session, call).Code
+		session = g.relay(http.MethodPost, "/mcp", bearer, "", map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize"}).Header().Get(mcpSessionHeader)
+		codes["first turn"] = g.relay(http.MethodPost, "/mcp", bearer, session, call).Code
 		return completedStream(remote, "task-1", "done")(context.Background(), contextID, messageID)
+	}, func(_ context.Context, contextID, messageID string) []item {
+		codes["next turn, same session"] = g.relay(http.MethodPost, "/mcp", remote.lastAuthorization(), session, call).Code
+		return completedStream(remote, "task-2", "done")(context.Background(), contextID, messageID)
 	})
 	g = newGovernedHarness(t, remote)
-	if recorder := g.governedTurn(testOwner(1), g.prompt("prompt-1")); recorder.Code != http.StatusOK {
-		t.Fatalf("governed turn = %d", recorder.Code)
+	o := testOwner(1)
+	for _, prompt := range []string{"prompt-1", "prompt-2"} {
+		p := g.prompt(prompt)
+		if recorder := g.governedTurn(o, p); recorder.Code != http.StatusOK {
+			t.Fatalf("governed turn %s = %d", prompt, recorder.Code)
+		}
+		g.control(settlePath, o, p)
 	}
-	want := map[string]int{"no session": http.StatusBadRequest, "stream": http.StatusMethodNotAllowed, "open": http.StatusOK,
-		"close": http.StatusNoContent, "closed": http.StatusBadRequest}
+	want := map[string]int{"no session": http.StatusBadRequest, "malformed session": http.StatusBadRequest,
+		"stream": http.StatusMethodNotAllowed, "first turn": http.StatusOK, "next turn, same session": http.StatusOK}
 	for name, code := range want {
 		if codes[name] != code {
 			t.Fatalf("%s = %d, want %d (all %v)", name, codes[name], code, codes)
 		}
+	}
+	calls, _ := g.mcp.snapshot()
+	if len(calls) != 2 || calls[0]["id"] == calls[1]["id"] {
+		t.Fatalf("the two turns' calls reached Orka as %v", calls)
 	}
 }
 

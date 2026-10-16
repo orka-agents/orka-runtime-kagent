@@ -229,10 +229,13 @@ func (t *turnBinding) addSession() (string, bool) {
 	return id, true
 }
 
-func (t *turnBinding) hasSession(id string) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return id != "" && t.sessions[id]
+// relaySessionID reports whether id has the form initialize issues. kagent's
+// Go runtime opens one MCP session per process and reuses it across turns and
+// Orka sessions, so the session ID carries no authority: the turn token on
+// each request does, and the call runs for that token's turn.
+func relaySessionID(id string) bool {
+	raw, err := hex.DecodeString(id)
+	return err == nil && len(raw) == 16 && hex.EncodeToString(raw) == id
 }
 
 func (t *turnBinding) closeSession(id string) {
@@ -327,7 +330,7 @@ func (b *lifecycleBroker) serveMCPRelay(response http.ResponseWriter, r *http.Re
 	case "ping":
 		writeRPC(w, rpc.ID, map[string]any{}, nil)
 	case "tools/list", "tools/call":
-		if !turn.hasSession(r.Header.Get(mcpSessionHeader)) {
+		if !relaySessionID(r.Header.Get(mcpSessionHeader)) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
