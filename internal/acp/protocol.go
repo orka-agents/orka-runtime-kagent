@@ -14,14 +14,27 @@ import (
 type acpRPCError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	// Data carries identifier-shaped diagnostics the Orka supervisor shows;
+	// it never copies free text.
+	Data *acpErrorData `json:"data,omitempty"`
+}
+
+type acpErrorData struct {
+	Service   string `json:"service"`
+	ErrorName string `json:"errorName"`
 }
 
 func (e *acpRPCError) Error() string { return e.Message }
 
+// kagentFailure reports one of the broker's fixed failure codes.
+func kagentFailure(code string) *acpRPCError {
+	return &acpRPCError{Code: -32603, Message: "kagent ACP prompt failed: " + code, Data: &acpErrorData{Service: "kagent", ErrorName: code}}
+}
+
 var (
-	acpInvalidRequest = &acpRPCError{-32600, "invalid ACP request"}
-	acpInvalidParams  = &acpRPCError{-32602, "invalid ACP parameters"}
-	acpInternalError  = &acpRPCError{-32603, "kagent ACP prompt failed"}
+	acpInvalidRequest = &acpRPCError{Code: -32600, Message: "invalid ACP request"}
+	acpInvalidParams  = &acpRPCError{Code: -32602, Message: "invalid ACP parameters"}
+	acpInternalError  = &acpRPCError{Code: -32603, Message: "kagent ACP prompt failed"}
 )
 
 type acpRequest struct {

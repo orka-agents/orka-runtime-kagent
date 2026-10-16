@@ -77,7 +77,18 @@ func (s *acpServer) runPrompt(ctx context.Context, session *acpSession, text str
 	}
 	defer response.Body.Close() //nolint:errcheck
 	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
-	if err != nil || response.StatusCode != http.StatusOK || mediaType != "text/event-stream" {
+	if response.StatusCode != http.StatusOK {
+		// The broker refuses before streaming with a fixed failure code.
+		var refusal struct {
+			Error string `json:"error"`
+		}
+		data, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
+		if mediaType == "application/json" && strictjson.Decode(data, &refusal, true) == nil && failureCodePattern.MatchString(refusal.Error) {
+			return kagentFailure(refusal.Error)
+		}
+		return errStream
+	}
+	if err != nil || mediaType != "text/event-stream" {
 		return errStream
 	}
 	watchdog := newIdleWatchdog(cancel, streamIdleTimeout)
@@ -173,7 +184,7 @@ func (s *acpServer) handleEvent(ctx context.Context, session *acpSession, tools 
 		if event.Response == nil || event.Response.Error == nil || !failureCodePattern.MatchString(event.Response.Error.Code) {
 			return false, errStream
 		}
-		return true, &acpRPCError{-32603, "kagent ACP prompt failed: " + event.Response.Error.Code}
+		return true, kagentFailure(event.Response.Error.Code)
 	default:
 		return false, errStream
 	}

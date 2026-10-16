@@ -205,7 +205,9 @@ func TestBrokerFailureCodeSurfacesAsPromptError(t *testing.T) {
 	}, "")
 	response := p.reply(p.prompt("hello"))
 	failure, _ := response["error"].(map[string]any)
-	if failure == nil || failure["message"] != "kagent ACP prompt failed: kagent_input_required" {
+	data, _ := failure["data"].(map[string]any)
+	if failure == nil || failure["message"] != "kagent ACP prompt failed: kagent_input_required" ||
+		data["service"] != "kagent" || data["errorName"] != "kagent_input_required" {
 		t.Fatalf("prompt = %v", response)
 	}
 	// A failed turn does not poison the session: kagent owns the conversation.
@@ -279,5 +281,26 @@ func TestGovernedPromptHandsTheOrkaMCPServerToTheBroker(t *testing.T) {
 	mcp, _ := body["mcp"].(map[string]any)
 	if mcp["url"] != "http://127.0.0.1:9/_orka/mcp/route" || mcp["authorization"] != "Bearer mcp-token" {
 		t.Fatalf("governed request body = %v", body)
+	}
+}
+
+func TestBrokerRefusalSurfacesItsCode(t *testing.T) {
+	p := newPeer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"kagent_revision_mismatch"}`))
+	}, "")
+	failure, _ := p.reply(p.prompt("hello"))["error"].(map[string]any)
+	data, _ := failure["data"].(map[string]any)
+	if data["errorName"] != "kagent_revision_mismatch" {
+		t.Fatalf("refusal = %v", failure)
+	}
+	p2 := newPeer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"Free text with spaces"}`))
+	}, "")
+	if failure, _ := p2.reply(p2.prompt("hello"))["error"].(map[string]any); failure["data"] != nil {
+		t.Fatalf("free text reached the error data: %v", failure)
 	}
 }

@@ -170,7 +170,7 @@ func (s *acpServer) respond(id json.RawMessage, result any, failure *acpRPCError
 func (s *acpServer) accept(line []byte) {
 	var request acpRequest
 	if !json.Valid(line) {
-		s.respond(nil, nil, &acpRPCError{-32700, "invalid ACP JSON"})
+		s.respond(nil, nil, &acpRPCError{Code: -32700, Message: "invalid ACP JSON"})
 		return
 	}
 	if strictjson.Decode(line, &request, true) != nil || request.JSONRPC != "2.0" || !config.SafeString(request.Method, 128) {
@@ -223,7 +223,7 @@ func (s *acpServer) accept(line []byte) {
 	case "session/prompt":
 		s.promptLocked(request, key)
 	default:
-		s.respond(request.ID, nil, &acpRPCError{-32601, "ACP method not supported"})
+		s.respond(request.ID, nil, &acpRPCError{Code: -32601, Message: "ACP method not supported"})
 	}
 }
 
@@ -311,7 +311,7 @@ func (s *acpServer) promptLocked(request acpRequest, key string) {
 		return
 	}
 	if s.active != nil {
-		s.respond(request.ID, nil, &acpRPCError{-32800, "ACP session already has an active prompt"})
+		s.respond(request.ID, nil, &acpRPCError{Code: -32800, Message: "ACP session already has an active prompt"})
 		return
 	}
 	op := s.newOperationLocked(request, key)
