@@ -269,7 +269,9 @@ func (s *acpServer) newSessionLocked(request acpRequest, _ string) {
 	cwd, err := os.Getwd()
 	requested, requestedErr := filepath.EvalSymlinks(params.CWD)
 	actual, actualErr := filepath.EvalSymlinks(cwd)
-	if err != nil || requestedErr != nil || actualErr != nil || requested != actual || !validMCPServer(params.MCPServers[0]) {
+	server := params.MCPServers[0]
+	if err != nil || requestedErr != nil || actualErr != nil || requested != actual || !validMCPServer(server) ||
+		(s.cfg.agent.Governed != nil && !config.SessionMCPServer(server.URL, server.Headers[0].Value)) {
 		s.respond(request.ID, nil, acpInvalidParams)
 		return
 	}
@@ -277,7 +279,6 @@ func (s *acpServer) newSessionLocked(request acpRequest, _ string) {
 	// Governed mode hands it to the broker, whose relay calls it for kagent.
 	s.session = &acpSession{id: acpOpaqueID("kagent-")}
 	if s.cfg.agent.Governed != nil {
-		server := params.MCPServers[0]
 		s.session.mcp = &sessionMCP{URL: server.URL, Authorization: server.Headers[0].Value}
 	}
 	s.respond(request.ID, map[string]string{"sessionId": s.session.id}, nil)

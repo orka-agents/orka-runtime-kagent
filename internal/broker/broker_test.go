@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -784,6 +785,25 @@ func TestLedgerSurvivesRestartAndRejectsTampering(t *testing.T) {
 	h.b = nil
 }
 
+func TestLedgerRejectsEmptyState(t *testing.T) {
+	for _, state := range []string{"null", "{}"} {
+		t.Run(state, func(t *testing.T) {
+			remote := newFakeRemote()
+			h := newHarness(t, remote)
+			h.b.close()
+			h.b = nil
+			if err := os.WriteFile(filepath.Join(h.dir, "state.json"), []byte(state), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := newLifecycleBroker(context.Background(), settings{
+				bearer: testBearer, configDigest: h.digest, stateDir: h.dir, model: testModel, expectedRevision: testRevision, userIDPrefix: "orka",
+			}, remote); err == nil {
+				t.Fatalf("state %s was accepted as a valid ledger", state)
+			}
+		})
+	}
+}
+
 func TestDispatchRequiresTheSessionToStillExist(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -901,6 +921,36 @@ func TestStuckCleanupQuarantinesUntilKagentDeletesTheSession(t *testing.T) {
 	if retired := h.control(retirePath, o, nil); !retired.RetirementProven || retired.State != "retired" {
 		t.Fatalf("retire after deletion = %#v", retired)
 	}
+}
+
+func TestDisconnectedPromptQuarantinesWithoutASettleCall(t *testing.T) {
+	remote := newFakeRemote()
+	started := make(chan struct{})
+	remote.streams = append(remote.streams, func(ctx context.Context, contextID, messageID string) []item {
+		remote.setTask(&a2atype.Task{ID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking}}, messageID)
+		remote.mu.Lock()
+		remote.stuck["task-1"] = true
+		remote.mu.Unlock()
+		close(started)
+		<-ctx.Done()
+		return []item{{err: ctx.Err()}}
+	})
+	h := newHarness(t, remote)
+	o, p := testOwner(1), h.prompt("prompt-1")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		body := turnBody()
+		h.request(ctx, responsesPath, h.header(responsesPath, o, p, 1, body), body)
+	}()
+	<-started
+	cancel()
+	<-done
+	// Orka never sends a settle call; the disconnect alone must start the
+	// cleanup deadline.
+	h.advance(defaultCleanupDeadline + time.Second)
+	eventually(t, "quarantine after a disconnect", func() bool { return strings.Contains(h.logs.String(), "kagent session quarantined") })
 }
 
 func TestRetiredRecordsArePrunedAfterRetention(t *testing.T) {

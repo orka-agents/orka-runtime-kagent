@@ -284,6 +284,19 @@ func TestGovernedPromptHandsTheOrkaMCPServerToTheBroker(t *testing.T) {
 	}
 }
 
+func TestGovernedSessionRequiresWhatTheBrokerRelays(t *testing.T) {
+	governed := strings.Replace(testConfig, `"kagent":{`, `"governed":{"upstreamBaseURL":"http://model.orka.svc:8080/v1","upstreamModel":"gpt-test"},"kagent":{`, 1)
+	for _, url := range []string{"http://localhost:9/_orka/mcp/route", "https://127.0.0.1:9/_orka/mcp/route", "http://127.0.0.1/_orka/mcp/route"} {
+		if p := newPeerWithConfig(t, func(http.ResponseWriter, *http.Request) {}, url, governed); p.session != "" {
+			t.Fatalf("governed session accepted MCP descriptor %s, which the broker refuses", url)
+		}
+	}
+	// Observed sessions never hand the server to the broker.
+	if p := newPeer(t, func(http.ResponseWriter, *http.Request) {}, "http://localhost:9/_orka/mcp/route"); p.session == "" {
+		t.Fatal("observed session refused a loopback host name")
+	}
+}
+
 func TestBrokerRefusalSurfacesItsCode(t *testing.T) {
 	p := newPeer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

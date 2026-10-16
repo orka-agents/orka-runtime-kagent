@@ -135,6 +135,20 @@ func UpstreamBaseURL(value string) (string, error) {
 	return strings.TrimSuffix(value, "/"), nil
 }
 
+// SessionMCPServer accepts only the pod-local Orka session MCP server that a
+// governed broker relays to: plain http to a literal loopback IP with an
+// explicit port, and a bounded bearer. The ACP child and the broker both use
+// it, so a descriptor the broker would refuse fails at session creation.
+func SessionMCPServer(rawURL, authorization string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || !strings.HasPrefix(u.Path, "/") {
+		return false
+	}
+	ip := net.ParseIP(u.Hostname())
+	token, ok := strings.CutPrefix(authorization, "Bearer ")
+	return ip != nil && ip.IsLoopback() && u.Port() != "" && ok && SafeString(token, 512) && !strings.ContainsAny(token, " \t")
+}
+
 // ControlPlaneURL validates the kagent controller base URL: plain http(s) with
 // a DNS host, no credentials, query, fragment, or path.
 func ControlPlaneURL(value string) (*url.URL, error) {

@@ -153,12 +153,15 @@ func openStore(dir, digest string) (*store, *ledger, error) {
 		s.close()
 		return nil, nil, errStorage
 	}
+	// Decode into an empty ledger so that a null or empty document cannot
+	// inherit the defaults above and pass as a valid, empty ledger.
 	data, err := os.ReadFile(path)
-	if err != nil || strictjson.Decode(data, l, true) != nil || !ledgerValid(l, digest) {
+	loaded := &ledger{}
+	if err != nil || strictjson.Decode(data, loaded, true) != nil || !ledgerValid(loaded, digest) {
 		s.close()
 		return nil, nil, errStorage
 	}
-	return s, l, nil
+	return s, loaded, nil
 }
 
 func (s *store) save(data []byte) error {

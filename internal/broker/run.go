@@ -83,19 +83,29 @@ func Run(args []string, getenv func(string) string) error {
 			return config.ErrConfig
 		}
 	}
+	// Bind the relay before admitting turns: a governed broker without its
+	// relay would accept turns whose every tool and model call fails.
+	var relayListener net.Listener
+	if relayAddr != "" {
+		if relayListener, err = net.Listen("tcp", relayAddr); err != nil {
+			return err
+		}
+		defer relayListener.Close() //nolint:errcheck
+	}
 	b, err := newLifecycleBroker(ctx, cfg, client)
 	if err != nil {
 		return err
 	}
 	defer b.close()
-	if relayAddr != "" {
+	errs := make(chan error, 2)
+	if relayListener != nil {
 		relay := &http.Server{
-			Addr: relayAddr, Handler: b.relayHandler(),
+			Handler: b.relayHandler(),
 			// Tool calls may wait for an Orka approval, so there is no write deadline.
 			ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second,
 			MaxHeaderBytes: 32 << 10,
 		}
-		go func() { _ = relay.ListenAndServe() }()
+		go func() { errs <- relay.Serve(relayListener) }()
 		defer func() {
 			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -108,7 +118,6 @@ func Run(args []string, getenv func(string) string) error {
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second,
 		MaxHeaderBytes: 32 << 10,
 	}
-	errs := make(chan error, 1)
 	go func() { errs <- server.ListenAndServe() }()
 	select {
 	case err := <-errs:

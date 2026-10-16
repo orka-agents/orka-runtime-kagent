@@ -10,10 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	"net/http"
-	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -127,15 +126,7 @@ type tokenUsage struct {
 }
 
 // valid accepts only the pod-local Orka MCP server with a bearer header.
-func (m relayMCP) valid() bool {
-	u, err := url.Parse(m.URL)
-	if err != nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || !strings.HasPrefix(u.Path, "/") {
-		return false
-	}
-	ip := net.ParseIP(u.Hostname())
-	token, ok := strings.CutPrefix(m.Authorization, "Bearer ")
-	return ip != nil && ip.IsLoopback() && u.Port() != "" && ok && config.SafeString(token, 512) && !strings.ContainsAny(token, " \t")
-}
+func (m relayMCP) valid() bool { return config.SessionMCPServer(m.URL, m.Authorization) }
 
 func newTurnToken() (token, digest string, err error) {
 	raw := make([]byte, turnTokenBytes)
@@ -432,8 +423,14 @@ func (b *lifecycleBroker) serveModelRelay(downstream http.ResponseWriter, r *htt
 	var stream bool
 	_ = json.Unmarshal(payload["stream"], &stream)
 	if stream {
-		options := map[string]json.RawMessage{}
-		_ = json.Unmarshal(payload["stream_options"], &options)
+		var options map[string]json.RawMessage
+		if raw, ok := payload["stream_options"]; ok && json.Unmarshal(raw, &options) != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if options == nil {
+			options = map[string]json.RawMessage{}
+		}
 		options["include_usage"] = json.RawMessage("true")
 		payload["stream_options"], _ = json.Marshal(options)
 	}
@@ -523,14 +520,24 @@ func chunkUsage(data []byte) (tokenUsage, bool) {
 }
 
 // canonicalJSON re-encodes a JSON-RPC ID so equal IDs digest equally.
+// Numeric IDs must be integers that fit in int64: decoding them as float64
+// would give distinct IDs above 2^53 the same digest.
 func canonicalJSON(raw json.RawMessage) ([]byte, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
 	var value any
-	if err := json.Unmarshal(raw, &value); err != nil {
+	if err := decoder.Decode(&value); err != nil {
 		return nil, err
 	}
-	switch value.(type) {
-	case string, float64:
-		return json.Marshal(value)
+	switch id := value.(type) {
+	case string:
+		return json.Marshal(id)
+	case json.Number:
+		n, err := strconv.ParseInt(id.String(), 10, 64)
+		if err != nil {
+			return nil, errors.New("JSON-RPC numeric ID must be an int64 integer")
+		}
+		return strconv.AppendInt(nil, n, 10), nil
 	default:
 		return nil, errors.New("JSON-RPC ID must be a string or number")
 	}

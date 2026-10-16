@@ -98,6 +98,7 @@ func (b *lifecycleBroker) serveResponses(w http.ResponseWriter, r *http.Request,
 	}
 
 	stream := newSSE(w)
+	defer stream.release()
 	responseID := "kr_" + uuid.NewString()
 	if stream.event("response.created", map[string]any{"type": "response.created", "response": map[string]string{"id": responseID, "status": "in_progress"}}) != nil {
 		b.finish(key, promptKey, c.InvocationSequence, nil)
@@ -545,7 +546,9 @@ func (b *lifecycleBroker) closePrompt(key, promptKey string) {
 	_ = b.commitLocked(false, func(next *ledger) error {
 		if s := next.Sessions[key]; s != nil {
 			if p := s.Prompts[promptKey]; p != nil {
-				p.Closing = true
+				// Start the cleanup deadline too, so a prompt whose cleanup never
+				// proves out is quarantined even without a later settle call.
+				p.startClosing(b.cfg.now())
 			}
 		}
 		return nil
@@ -602,18 +605,30 @@ func (t *toolRelay) relay(parts []*a2atype.Part) {
 	}
 }
 
-// sse serializes server-sent events and keepalive comments.
+// sseWriteStall bounds one lifecycle stream write. It exceeds the keepalive
+// interval, so an idle but healthy stream never trips it.
+const sseWriteStall = 30 * time.Second
+
+// sse serializes server-sent events and keepalive comments. Every write and
+// flush gets a rolling deadline, so a supervisor that stops reading fails the
+// stream instead of blocking the turn and broker shutdown behind it.
 type sse struct {
 	mu      sync.Mutex
 	w       http.ResponseWriter
-	flusher http.Flusher
+	control *http.ResponseController
 	started bool
 	failed  bool
 }
 
 func newSSE(w http.ResponseWriter) *sse {
-	flusher, _ := w.(http.Flusher)
-	return &sse{w: w, flusher: flusher}
+	return &sse{w: w, control: http.NewResponseController(w)}
+}
+
+// release clears the write deadline so a reused connection does not inherit it.
+func (s *sse) release() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.control.SetWriteDeadline(time.Time{})
 }
 
 func (s *sse) start() {
@@ -631,13 +646,15 @@ func (s *sse) write(frame []byte) error {
 	if s.failed {
 		return errClosed
 	}
+	_ = s.control.SetWriteDeadline(time.Now().Add(sseWriteStall))
 	s.start()
 	if _, err := s.w.Write(frame); err != nil {
 		s.failed = true
 		return err
 	}
-	if s.flusher != nil {
-		s.flusher.Flush()
+	if err := s.control.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		s.failed = true
+		return err
 	}
 	return nil
 }

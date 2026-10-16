@@ -268,3 +268,53 @@ func TestRelayAnswersRefusalsOverARealConnection(t *testing.T) {
 		}
 	}
 }
+
+func TestCanonicalJSONKeepsEveryIntegerIDDistinct(t *testing.T) {
+	first, err := canonicalJSON(json.RawMessage("9007199254740992"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := canonicalJSON(json.RawMessage("9007199254740993"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) == string(second) {
+		t.Fatalf("distinct IDs share the canonical form %s", first)
+	}
+	if number, _ := canonicalJSON(json.RawMessage("7")); string(number) != "7" {
+		t.Fatalf("canonical 7 = %s", number)
+	}
+	if text, _ := canonicalJSON(json.RawMessage(`"7"`)); string(text) != `"7"` {
+		t.Fatalf(`canonical "7" = %s`, text)
+	}
+	for _, id := range []string{"1.5", "1e3", "9223372036854775808", "null", "true", "{}"} {
+		if _, err := canonicalJSON(json.RawMessage(id)); err == nil {
+			t.Fatalf("ID %s was accepted", id)
+		}
+	}
+}
+
+func TestModelRelayHandlesNullAndInvalidStreamOptions(t *testing.T) {
+	remote := newFakeRemote()
+	var g *governedHarness
+	var nullOptions, badOptions *httptest.ResponseRecorder
+	remote.streams = append(remote.streams, func(_ context.Context, contextID, messageID string) []item {
+		bearer := remote.lastAuthorization()
+		messages := []any{map[string]any{"role": "user", "content": "hi"}}
+		nullOptions = g.relay(http.MethodPost, "/v1/chat/completions", bearer, "", map[string]any{"stream": true, "stream_options": nil, "messages": messages})
+		badOptions = g.relay(http.MethodPost, "/v1/chat/completions", bearer, "", map[string]any{"stream": true, "stream_options": 5, "messages": messages})
+		return completedStream(remote, "task-1", "done")(context.Background(), contextID, messageID)
+	})
+	g = newGovernedHarness(t, remote)
+	if recorder := g.governedTurn(testOwner(1), g.prompt("prompt-1")); recorder.Code != http.StatusOK {
+		t.Fatalf("governed turn = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if nullOptions.Code != http.StatusOK || badOptions.Code != http.StatusBadRequest {
+		t.Fatalf("null stream_options = %d, invalid stream_options = %d", nullOptions.Code, badOptions.Code)
+	}
+	g.model.mu.Lock()
+	defer g.model.mu.Unlock()
+	if len(g.model.bodies) != 1 || g.model.bodies[0]["stream_options"].(map[string]any)["include_usage"] != true {
+		t.Fatalf("model upstream saw %v", g.model.bodies)
+	}
+}
