@@ -280,19 +280,21 @@ check_relay_rejects_strangers() {
 
 check_control_plane_filter() {
   forward "$PROBE_NS" "svc/$CPFILTER_SERVICE" 8083 || { fail "control-plane filter" "port-forward to the filter did not start"; return; }
-  # grpc prints "<http status> <grpc-status trailer>" for one empty call.
+  # grpc prints "<http status> <grpc-status> <grpc-message>" for one empty call.
   grpc() {
     local headers="$WORK/grpc-headers" code
     code=$(curl -s -o /dev/null -D "$headers" -w '%{http_code}' --max-time 10 --http2-prior-knowledge -X POST \
       -H 'Content-Type: application/grpc' --data-binary @/dev/null "http://127.0.0.1:$FORWARD_PORT$1") || code=000
-    printf '%s %s' "$code" "$(tr -d '\r' < "$headers" 2>/dev/null | sed -n 's/^grpc-status: *//Ip' | tail -1)"
+    printf '%s %s %s' "$code" "$(tr -d '\r' < "$headers" 2>/dev/null | sed -n 's/^grpc-status: *//Ip' | tail -1)" \
+      "$(tr -d '\r' < "$headers" 2>/dev/null | sed -n 's/^grpc-message: *//Ip' | tail -1)"
   }
   local service=/kagent.runtime.v1.TaskStoreService problems=""
   for method in CreateTask GetTask UpdateTask ListTasks SettleTask; do
-    # Reaching kagent's server is a 200 whose gRPC status is neither
-    # UNIMPLEMENTED (12) nor UNAVAILABLE (14).
+    # Only kagent's gRPC server, after it has resolved the method, rejects an
+    # empty unary call as a cardinality violation (INTERNAL, 13). Any other
+    # status, such as a filter's PERMISSION_DENIED (7), is not proof.
     local result; result=$(grpc "$service/$method")
-    [[ $result =~ ^200\ ([0-9]+)$ && ${BASH_REMATCH[1]} != 12 && ${BASH_REMATCH[1]} != 14 ]] || problems="$problems $method=[$result]"
+    [[ $result == "200 13 "*"cardinality violation"* ]] || problems="$problems $method=[$result]"
   done
   for denied in /kagent.runtime.v1.MemoryService/Search "$service/GetTaskX" "$service/" "${service}X/GetTask" /kagent.api.v1.SessionService/ListSessions; do
     local result; result=$(grpc "$denied")
@@ -312,17 +314,21 @@ check_compiled_egress() {
   [[ $revision =~ ^[0-9a-f]{64}$ ]] || { fail "compiled egress" "no pinned revision for $GOVERNED_KAGENT_AGENT"; return; }
   relay="http://$RELAY_SERVICE.$ORKA_NS.svc:8092"
   local egress; egress=$(printf "select array_to_string(egress_destinations, ' ') from kagent.agent_runtime_revision where revision='%s';\n" "$revision" | pg)
-  local stray=""
+  local stray="" missing=""
   for destination in $egress; do
     case " $relay $CPFILTER_URL $PROVIDER_DEFAULT_HOSTS " in
       *" $destination "*) ;;
       *) stray="$stray $destination" ;;
     esac
   done
-  if [[ -n $egress && -z $stray ]]; then
+  # The governed setup needs both; a list of provider hosts alone is not it.
+  for required in "$relay" "$CPFILTER_URL"; do
+    [[ " $egress " == *" $required "* ]] || missing="$missing $required"
+  done
+  if [[ -n $egress && -z $stray && -z $missing ]]; then
     pass "the governed revision's egress names only the relay, the filter, and accepted provider hosts"
   else
-    fail "compiled egress" "revision=$revision unexpected:${stray:- <no egress found>}"
+    fail "compiled egress" "revision=$revision unexpected:${stray:- none} missing:${missing:- none} egress:${egress:- <none found>}"
   fi
 }
 

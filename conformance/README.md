@@ -21,8 +21,8 @@ not passed it is unsupported, whatever its version numbers.
 | governed turn | Orka gates the governed Agent's tool call on approval, executes it, and counts the model's tokens. |
 | approval expiry (`LONG=1`) | An expired approval never executes the tool. |
 | relay authentication | The relay refuses callers without a live turn token. |
-| control-plane filter | Agents reach exactly the five TaskStore methods. `MemoryService` and unlisted TaskStore methods are denied. |
-| compiled egress | The governed revision's egress lists only the relay, the control-plane filter, and the accepted provider default hosts. |
+| control-plane filter | Agents reach exactly the five TaskStore methods, each answered by kagent's own server. `MemoryService` and unlisted TaskStore methods are denied. |
+| compiled egress | The governed revision's egress lists the relay and the control-plane filter, and nothing else but the accepted provider default hosts. |
 | timeout chain | The governed `RemoteMCPServer` waits strictly longer than the relay's 20 minutes. |
 | session retirement | Every kagent session Orka created has been deleted. |
 

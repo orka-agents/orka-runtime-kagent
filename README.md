@@ -86,7 +86,9 @@ kagent to call:
   policy, approvals, credentials, and audit apply to every call.
 - `/v1/chat/completions` forwards model calls to `upstreamBaseURL`. It pins
   `upstreamModel`, adds Orka's credential (`ORKA_KAGENT_MODEL_UPSTREAM_TOKEN`),
-  and totals token usage for Orka.
+  and totals token usage for Orka. The relay sends that credential on every
+  model call, so use an `https` `upstreamBaseURL` unless the network path to
+  it is trusted.
 
 ### Turn tokens
 
@@ -107,7 +109,7 @@ digest then keeps it fixed.
 - Every tool comes from one `RemoteMCPServer`:
   - its URL is the relay's `/mcp`;
   - its protocol is `STREAMABLE_HTTP`;
-  - its `timeout` is at least `20m`;
+  - its `timeout` is longer than `20m`;
   - it carries the `kagent.dev/discovery=disabled` label, because the relay
     answers only turn-scoped callers.
 - The revision's egress list names only the relay and the control-plane
@@ -249,7 +251,11 @@ make docker-build-acp-kagent-runtime \
 - **Bounded ledger.**
   - Retired sessions are pruned 24 hours after retirement.
   - A ledger holds at most 4096 live sessions.
-  - Each session holds at most 4096 prompts.
+  - Each session holds at most 4096 prompts. Settled prompts count until the
+    session is retired.
+  - New prompts, new sessions, and lease renewals stop when the ledger reaches
+    24 MiB, and the broker answers 503. The last 8 MiB stays for settling and
+    retiring what the ledger already holds.
 - **One request per prompt.** Each prompt sends a single request to the broker.
 - **Claude and Codex harnesses are observed only.** They reject
   `apiKeyPassthrough`, so the relay cannot tell which session is calling.
