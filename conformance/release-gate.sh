@@ -54,7 +54,11 @@ forward() {
 stop_forward() { kill "$FORWARD_PID" 2>/dev/null; wait "$FORWARD_PID" 2>/dev/null; FORWARD_PID=""; }
 
 # http_code prints curl's status code, or "000" when no response arrived.
-http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@" || printf '000'; }
+http_code() {
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@") || code=000
+  printf '%s' "$code"
+}
 
 probe_sleep() {
   forward "$PROBE_NS" deploy/probe-mcp 8080 || return 1
@@ -101,8 +105,16 @@ wait_tool_started() {
   return 1
 }
 
-# tool_cancellations counts probe tool calls cancelled since a time.
-tool_cancellations() { kubectl -n "$PROBE_NS" logs deploy/probe-mcp --since-time="$1" | grep -c '"tools/call cancelled"'; }
+# cancelled_tool_user prints the kagent user whose probe tool call started
+# after a time, only if that same user's call was then cancelled. kagent
+# user IDs are per Orka session, so this ties the cancellation to the call
+# under test.
+cancelled_tool_user() {
+  local logs user
+  logs=$(kubectl -n "$PROBE_NS" logs deploy/probe-mcp --since-time="$1") || return 1
+  user=$(printf '%s\n' "$logs" | grep '"rpc":"tools/call"' | grep -o '"x_user_id":"orka-[0-9a-f]\{40\}"' | head -1 | cut -d'"' -f4)
+  [[ -n $user ]] && printf '%s\n' "$logs" | grep '"tools/call cancelled"' | grep -q "\"x_user_id\":\"$user\"" && printf '%s' "$user"
+}
 
 # yaml_leaves prints "a.b.c=value" for each scalar in a block-style YAML map.
 yaml_leaves() {
@@ -156,12 +168,12 @@ check_deadline_cancel() {
   create_task "$name" "$OBSERVED_AGENT" 1m '[]'
   wait_tool_started "$name" && started=yes
   local phase; phase=$(wait_terminal "$name" 60)
-  local cancelled; cancelled=$(tool_cancellations "$start")
+  local user; user=$(cancelled_tool_user "$start")
   probe_sleep 0 || fail "deadline cancellation" "could not reset the probe tool"
-  if [[ $started == yes && $phase == Cancelled && ${cancelled:-0} -gt 0 ]]; then
+  if [[ $started == yes && $phase == Cancelled && -n $user ]]; then
     pass "a Task deadline cancels the in-flight kagent tool call"
   else
-    fail "deadline cancellation" "tool-started=$started phase=$phase cancelled-calls=${cancelled:-0}"
+    fail "deadline cancellation" "tool-started=$started phase=$phase cancelled-user=${user:-<none>}"
   fi
 }
 
@@ -178,12 +190,12 @@ check_delete_cancel() {
   fi
   local deleted=no
   kubectl -n "$ORKA_NS" delete tasks.core.orka.ai "$name" --wait=true --timeout=4m >/dev/null 2>&1 && deleted=yes
-  local cancelled; cancelled=$(tool_cancellations "$start")
+  local user; user=$(cancelled_tool_user "$start")
   probe_sleep 0 || fail "delete cancellation" "could not reset the probe tool"
-  if [[ $deleted == yes && ${cancelled:-0} -gt 0 ]]; then
+  if [[ $deleted == yes && -n $user ]]; then
     pass "deleting a Task mid-tool cancels the kagent work and finishes cleanup"
   else
-    fail "delete cancellation" "deleted=$deleted cancelled-calls=${cancelled:-0}"
+    fail "delete cancellation" "deleted=$deleted cancelled-user=${user:-<none>}"
   fi
 }
 
@@ -236,15 +248,23 @@ check_relay_rejects_strangers() {
 
 check_control_plane_filter() {
   forward "$PROBE_NS" "svc/$CPFILTER_SERVICE" 8083 || { fail "control-plane filter" "port-forward to the filter did not start"; return; }
-  grpc() { http_code --http2-prior-knowledge -X POST -H 'Content-Type: application/grpc' --data-binary @/dev/null "http://127.0.0.1:$FORWARD_PORT$1"; }
+  # grpc prints "<http status> <grpc-status trailer>" for one empty call.
+  grpc() {
+    local headers="$WORK/grpc-headers" code
+    code=$(curl -s -o /dev/null -D "$headers" -w '%{http_code}' --max-time 10 --http2-prior-knowledge -X POST \
+      -H 'Content-Type: application/grpc' --data-binary @/dev/null "http://127.0.0.1:$FORWARD_PORT$1") || code=000
+    printf '%s %s' "$code" "$(tr -d '\r' < "$headers" 2>/dev/null | sed -n 's/^grpc-status: *//Ip' | tail -1)"
+  }
   local service=/kagent.runtime.v1.TaskStoreService problems=""
   for method in CreateTask GetTask UpdateTask ListTasks SettleTask; do
-    local code; code=$(grpc "$service/$method")
-    [[ $code == 000 || $code == 403 ]] && problems="$problems $method=$code"
+    # Reaching kagent's server is a 200 whose gRPC status is neither
+    # UNIMPLEMENTED (12) nor UNAVAILABLE (14).
+    local result; result=$(grpc "$service/$method")
+    [[ $result =~ ^200\ ([0-9]+)$ && ${BASH_REMATCH[1]} != 12 && ${BASH_REMATCH[1]} != 14 ]] || problems="$problems $method=[$result]"
   done
   for denied in /kagent.runtime.v1.MemoryService/Search "$service/GetTaskX" "$service/" "${service}X/GetTask" /kagent.api.v1.SessionService/ListSessions; do
-    local code; code=$(grpc "$denied")
-    [[ $code != 403 ]] && problems="$problems $denied=$code"
+    local result; result=$(grpc "$denied")
+    [[ $result == "403 "* ]] || problems="$problems $denied=[$result]"
   done
   stop_forward
   if [[ -z $problems ]]; then
