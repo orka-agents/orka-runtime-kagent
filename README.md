@@ -4,7 +4,7 @@ This adapter lets Orka govern an agent that runs on [kagent](https://github.com/
 v1, the Substrate-based design. kagent keeps running the agent's reasoning loop.
 Orka owns how work reaches the agent, its identity and lifecycle, and the audit record.
 
-> **Status:** experimental and local only. It is tested against kagent
+> **Status:** experimental. It is tested against kagent
 > `1eb89fb1` (v1.0.0-alpha13+31) with kagent's Substrate fork v0.5.0-alpha2.
 
 ## How it fits together
