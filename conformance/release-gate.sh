@@ -30,6 +30,7 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"; [[ -n ${FORWARD_PID:-} ]] && kill "$FORWARD_PID" 2>/dev/null' EXIT
 
 failures=0
+skipped=0
 pass() { printf 'PASS  %s\n' "$1"; }
 fail() { printf 'FAIL  %s: %s\n' "$1" "$2"; failures=$((failures + 1)); }
 
@@ -58,6 +59,16 @@ http_code() {
   local code
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@") || code=000
   printf '%s' "$code"
+}
+
+# tool_calls prints the probe's "<boot> <count>" of /tool executions. The
+# counter lives in the probe process, so log rotation cannot hide a call; a
+# changed boot means a restart lost the count.
+tool_calls() {
+  forward "$PROBE_NS" deploy/probe-mcp 8080 || return 1
+  local reply; reply=$(curl -s --max-time 10 "http://127.0.0.1:$FORWARD_PORT/admin/tool-calls")
+  stop_forward
+  printf '%s' "$reply" | jq -er '"\(.boot) \(.count)"'
 }
 
 probe_sleep() {
@@ -105,47 +116,55 @@ wait_tool_started() {
   return 1
 }
 
+# probe_identity prints the probe-mcp pod's name, UID, and restart count, or
+# nothing unless exactly one pod serves it. Logs read later are complete
+# only if this identity has not changed.
+probe_identity() {
+  kubectl -n "$PROBE_NS" get pods -l app=probe-mcp -o json 2>/dev/null |
+    jq -r 'if (.items | length) == 1 then .items[0] | "\(.metadata.name):\(.metadata.uid):\([.status.containerStatuses[]?.restartCount] | add)" else empty end'
+}
+
 # cancelled_tool_user prints the kagent user whose probe tool call started
-# after a time, only if that same user's call was then cancelled. kagent
-# user IDs are per Orka session, so this ties the cancellation to the call
-# under test.
-cancelled_tool_user() {
-  local logs user
+# after a time, only if that user's call was then cancelled. The gate needs
+# the probe to itself: kagent user IDs are per Orka session, and if more
+# than one session calls the probe in the window, or a call carries no
+# valid user, the cancellation cannot be tied to the call under test.
+cancelled_tool_user() { # cancelled_tool_user <since> <probe identity at the start>
+  local logs calls users user
+  [[ -n $2 ]] || return 1
   logs=$(kubectl -n "$PROBE_NS" logs deploy/probe-mcp --since-time="$1") || return 1
-  user=$(printf '%s\n' "$logs" | grep '"rpc":"tools/call"' | grep -o '"x_user_id":"orka-[0-9a-f]\{40\}"' | head -1 | cut -d'"' -f4)
-  [[ -n $user ]] && printf '%s\n' "$logs" | grep '"tools/call cancelled"' | grep -q "\"x_user_id\":\"$user\"" && printf '%s' "$user"
+  # The logs are complete only from the same, unrestarted, single pod.
+  [[ $(probe_identity) == "$2" ]] || return 1
+  calls=$(printf '%s\n' "$logs" | grep '"rpc":"tools/call"')
+  [[ -n $calls ]] || return 1
+  users=$(printf '%s\n' "$calls" | grep -o '"x_user_id":"[^"]*"' | sort -u)
+  [[ $(printf '%s\n' "$calls" | wc -l) == $(printf '%s\n' "$calls" | grep -c '"x_user_id":"orka-[0-9a-f]\{40\}"') ]] || return 1
+  [[ $(printf '%s\n' "$users" | wc -l) == 1 ]] || return 1
+  user=$(printf '%s' "$users" | cut -d'"' -f4)
+  printf '%s\n' "$logs" | grep '"tools/call cancelled"' | grep -q "\"x_user_id\":\"$user\"" && printf '%s' "$user"
 }
 
-# yaml_leaves prints "a.b.c=value" for each scalar in a block-style YAML map.
-yaml_leaves() {
-  awk '
-    /^[[:space:]]*(#|$)/ { next }
-    /^[[:space:]]*-/ { next }
-    {
-      indent = match($0, /[^ ]/) - 1
-      line = substr($0, indent + 1)
-      key = line; sub(/:.*/, "", key)
-      value = line; sub(/^[^:]*:[[:space:]]*/, "", value)
-      while (depth > 0 && indents[depth] >= indent) depth--
-      depth++; indents[depth] = indent; keys[depth] = key
-      if (value != "") {
-        path = keys[1]; for (i = 2; i <= depth; i++) path = path "." keys[i]
-        gsub(/^["\x27]|["\x27]$/, "", value)
-        print path "=" value
-      }
-    }'
+# governed_revision prints the governed Agent's pinned kagent revision.
+governed_revision() {
+  kubectl -n "$KAGENT_NS" get agents.api.kagent.dev "$GOVERNED_KAGENT_AGENT" -o jsonpath='{.status.latestSuccessfulRevision}'
 }
 
-check_controller_settings() {
-  local leaves; leaves=$(kubectl -n "$KAGENT_NS" get configmap "$KAGENT_CONTROLLER_CONFIG" -o jsonpath='{.data.controller\.yaml}' | yaml_leaves)
-  local bash tokens url
-  bash=$(printf '%s\n' "$leaves" | sed -n 's/^runtimeDefaults\.skillTools\.disableBash=//p')
-  tokens=$(printf '%s\n' "$leaves" | sed -n 's/^runtimeDefaults\.tokenPropagation\.enabled=//p')
-  url=$(printf '%s\n' "$leaves" | sed -n 's/^runtimeDefaults\.controlPlaneUrl=//p')
-  if [[ $bash == true && $tokens == true && $url == "$CPFILTER_URL" ]]; then
-    pass "kagent disables skill bash, forwards the turn token, and sends agents through the filter"
+check_compiled_settings() {
+  # Runtime defaults are compiled into each revision's actor template, so
+  # this reads what the pinned revision runs with, not the desired config.
+  local revision; revision=$(governed_revision)
+  [[ $revision =~ ^[0-9a-f]{64}$ ]] || { fail "compiled runtime settings" "no pinned revision for $GOVERNED_KAGENT_AGENT"; return; }
+  local query="select encode(t.proto, 'escape') from kagent.agent_runtime_revision r join substrate.actor_templates t
+    on t.name = r.actor_template_name and t.atespace = r.actor_template_atespace where r.revision = '$revision';"
+  local compiled; compiled=$(printf '%s\n' "$query" | pg | tr -d '\n')
+  local problems=""
+  [[ $compiled =~ \"skill_tools\":\{[^}]*\"disable_bash\":true ]] || problems="$problems skill-bash-enabled"
+  [[ $compiled =~ \"token_propagation\":\{[^}]*\"enabled\":true ]] || problems="$problems no-token-propagation"
+  [[ $compiled == *"\"control_plane_url\":\"$CPFILTER_URL\""* ]] || problems="$problems control-plane-not-filtered"
+  if [[ -n $compiled && -z $problems ]]; then
+    pass "the pinned revision disables skill bash, forwards the turn token, and uses the filter"
   else
-    fail "kagent controller settings" "disableBash=${bash:-<unset>} tokenPropagation=${tokens:-<unset>} controlPlaneUrl=${url:-<unset>}"
+    fail "compiled runtime settings" "revision=$revision${problems:- <no compiled template found>}"
   fi
 }
 
@@ -162,13 +181,14 @@ check_observed_turn() {
 }
 
 check_deadline_cancel() {
-  local name="$RUN-deadline" start started=no
+  local name="$RUN-deadline" start started=no identity
   probe_sleep 400 || { fail "deadline cancellation" "could not make the probe tool wait"; return; }
+  identity=$(probe_identity)
   start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   create_task "$name" "$OBSERVED_AGENT" 1m '[]'
   wait_tool_started "$name" && started=yes
   local phase; phase=$(wait_terminal "$name" 60)
-  local user; user=$(cancelled_tool_user "$start")
+  local user; user=$(cancelled_tool_user "$start" "$identity")
   probe_sleep 0 || fail "deadline cancellation" "could not reset the probe tool"
   if [[ $started == yes && $phase == Cancelled && -n $user ]]; then
     pass "a Task deadline cancels the in-flight kagent tool call"
@@ -178,8 +198,9 @@ check_deadline_cancel() {
 }
 
 check_delete_cancel() {
-  local name="$RUN-delete" start
+  local name="$RUN-delete" start identity
   probe_sleep 400 || { fail "delete cancellation" "could not make the probe tool wait"; return; }
+  identity=$(probe_identity)
   start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   create_task "$name" "$OBSERVED_AGENT" 5m '[]'
   if ! wait_tool_started "$name"; then
@@ -190,7 +211,7 @@ check_delete_cancel() {
   fi
   local deleted=no
   kubectl -n "$ORKA_NS" delete tasks.core.orka.ai "$name" --wait=true --timeout=4m >/dev/null 2>&1 && deleted=yes
-  local user; user=$(cancelled_tool_user "$start")
+  local user; user=$(cancelled_tool_user "$start" "$identity")
   probe_sleep 0 || fail "delete cancellation" "could not reset the probe tool"
   if [[ $deleted == yes && -n $user ]]; then
     pass "deleting a Task mid-tool cancels the kagent work and finishes cleanup"
@@ -218,15 +239,26 @@ check_governed_turn() {
 }
 
 check_approval_expiry() {
-  [[ $LONG == 1 ]] || { printf 'SKIP  approval expiry fails closed (LONG=1 runs it)\n'; return; }
-  local name="$RUN-expiry"
+  [[ $LONG == 1 ]] || { printf 'SKIP  approval expiry fails closed (LONG=1 runs it)\n'; skipped=$((skipped + 1)); return; }
+  local name="$RUN-expiry" identity before
+  identity=$(probe_identity)
+  [[ -n $identity ]] || { fail "approval expiry" "the probe tool backend is not exactly one pod"; return; }
+  before=$(tool_calls) || { fail "approval expiry" "could not read the probe's tool-call counter"; return; }
   create_task "$name" "$GOVERNED_AGENT" 12m "[$GOVERNED_TOOL]"
   local phase; phase=$(wait_terminal "$name" 160)
   local seen; seen=$(events "$name")
-  if [[ $phase =~ ^(Failed|Cancelled|TimedOut)$ && $seen == *ApprovalExpired* && $seen != *ToolCallCompleted* ]]; then
+  # The governed tool's backend is the probe's /tool endpoint: any call
+  # there after an expired approval is an execution. The Task itself may
+  # still succeed, since the model can finish after an error tool result.
+  # The count is complete only from the same, unrestarted probe process.
+  local after executions=unknown
+  if after=$(tool_calls) && [[ ${after%% *} == "${before%% *}" && $(probe_identity) == "$identity" ]]; then
+    executions=$((${after##* } - ${before##* }))
+  fi
+  if [[ $phase =~ ^(Succeeded|Failed|Cancelled|TimedOut)$ && $seen == *ApprovalExpired* && $executions == 0 ]]; then
     pass "an expired approval never executes the tool"
   else
-    fail "approval expiry" "phase=$phase events=$seen"
+    fail "approval expiry" "phase=$phase executions=$executions events=$seen"
   fi
 }
 
@@ -306,7 +338,9 @@ check_timeout_chain() {
 
 check_sessions_retired() {
   # Orka-created sessions belong to per-session users named orka-<40 hex>.
-  local live; live=$(printf "select count(*) from kagent.session where encode(data,'escape') ~ 'orka-[0-9a-f]{40}' and deletion_reason is null;\n" | pg)
+  # Only the terminal state proves deletion; a deletion reason is recorded
+  # when deletion is merely admitted.
+  local live; live=$(printf "select count(*) from kagent.runtime_instance where kind = 'agent' and user_id ~ '^orka-[0-9a-f]{40}\$' and state <> 'RUNTIME_STATE_DELETED';\n" | pg)
   if [[ $live == 0 ]]; then
     pass "every kagent session Orka created has been deleted"
   else
@@ -314,7 +348,7 @@ check_sessions_retired() {
   fi
 }
 
-check_controller_settings
+check_compiled_settings
 check_observed_turn
 check_deadline_cancel
 check_delete_cancel
@@ -330,4 +364,9 @@ if [[ $failures -gt 0 ]]; then
   printf '\n%d check(s) failed; this tuple is not supported.\n' "$failures"
   exit 1
 fi
-printf '\nAll checks passed for this tuple.\n'
+if [[ $skipped -gt 0 ]]; then
+  # Only a run of every check qualifies a tuple.
+  printf '\nThe checks that ran passed, but %d were skipped; run with LONG=1 to qualify this tuple.\n' "$skipped"
+  exit 2
+fi
+printf '\nAll checks passed; this tuple is supported.\n'
