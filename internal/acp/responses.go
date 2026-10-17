@@ -18,7 +18,9 @@ import (
 )
 
 const (
-	maxStreamBytes = 16 << 20
+	// The broker sends at most 4 MiB of text, and JSON may spell each byte of
+	// it as a six-byte \u escape. The rest covers the stream's other events.
+	maxStreamBytes = 32 << 20
 	maxEventBytes  = 1 << 20
 	maxToolCalls   = 256
 )

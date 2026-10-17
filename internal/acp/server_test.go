@@ -312,6 +312,33 @@ func TestOversizedEncodedPromptIsInvalid(t *testing.T) {
 	}
 }
 
+// The broker's text limit applies before JSON escaping, which can make the
+// stream six times longer than the text it carries.
+func TestEscapedOutputAtTheBrokerLimitIsRelayed(t *testing.T) {
+	const text, chunk = 4 << 20, 16 << 10
+	p := newPeer(t, func(w http.ResponseWriter, _ *http.Request) {
+		events := []string{created}
+		for range text / chunk {
+			event, _ := json.Marshal(map[string]string{"type": "response.output_text.delta", "delta": strings.Repeat("<", chunk)})
+			events = append(events, string(event))
+		}
+		sse(w, append(events, completed)...)
+	}, "")
+	response := p.reply(p.prompt("hello"))
+	if response["result"] == nil || response["result"].(map[string]any)["stopReason"] != "end_turn" {
+		t.Fatalf("prompt = %v", response)
+	}
+	relayed := 0
+	for _, event := range p.events {
+		if content, ok := event["content"].(map[string]any); ok {
+			relayed += len(content["text"].(string))
+		}
+	}
+	if relayed != text {
+		t.Fatalf("relayed %d bytes of text, want %d", relayed, text)
+	}
+}
+
 func TestBrokerRefusalSurfacesItsCode(t *testing.T) {
 	p := newPeer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
