@@ -289,7 +289,12 @@ where this section says otherwise.
   compiled config, agent card, and secrets, so it changes when the Agent or
   anything it references changes. Before every dispatch the broker requires
   exactly one ready pod object with that hash. A rollout or restart in
-  progress, terminating pods included, refuses the turn.
+  progress, terminating pods included, refuses the turn. The pin is checked,
+  not bound: kagent's controller then routes the send through the Agent's
+  Service, and v0 has no per-session revision as v1 does. A pod created after
+  the check that is ready and in the Service by the time the controller
+  forwards the send would run that one turn on its configuration. Later sends
+  are refused.
 - **One replica.** A cancel reaches only the pod that runs the task, so a
   wrapped v0 Agent must run a single replica.
 - **Settlement.** Deleting a v0 session only marks its row; a running turn
