@@ -39,6 +39,11 @@ var v0ConfigHash = regexp.MustCompile(`^(0|[1-9][0-9]{0,19})$`)
 // running the task.
 var ErrRollout = errors.New("kagent Agent is not exactly one ready pod")
 
+// ErrUnpinned reports that kagent holds the session but the Agent's config
+// could not be pinned. The returned Session carries the ID so the session can
+// still be owned and deleted; nothing may be sent in it until a read pins it.
+var ErrUnpinned = errors.New("kagent session exists but its Agent config is not pinned")
+
 // ConfigPin reports the pods kagent runs an Agent in.
 type ConfigPin interface {
 	// ConfigHash returns the config hash of the Agent's only pod, or
@@ -222,7 +227,7 @@ func (c *V0Client) session(ctx context.Context, s *v0Session, id, userID string)
 	}
 	hash, err := c.pin.ConfigHash(ctx)
 	if err != nil {
-		return Session{}, err
+		return Session{ID: s.ID}, fmt.Errorf("%w: %w", ErrUnpinned, err)
 	}
 	return Session{ID: s.ID, Revision: hash}, nil
 }

@@ -59,6 +59,7 @@ type fakeRemote struct {
 	findErr   error
 	cancelErr error    // CancelTask fails with this, as a timed-out cancel would
 	pods      []string // UIDs of the pods running the Agent (kagent v0)
+	unpinned  bool     // sessions exist, but the Agent's config cannot be pinned (kagent v0)
 	onFind    func()   // runs during a task lookup
 	auth      string   // the authorization of the latest stream
 	// v0 models kagent v0.x: a deleted session's tasks stay readable and
@@ -137,11 +138,14 @@ func (f *fakeRemote) CreateSession(_ context.Context, userID, requestID string) 
 			return kagent.Session{}, err
 		}
 	}
-	if s, ok := f.sessions[requestID]; ok {
-		return s, nil
+	s, ok := f.sessions[requestID]
+	if !ok {
+		s = kagent.Session{ID: uuid.NewString(), Revision: f.revision}
+		f.sessions[requestID], f.owners[s.ID] = s, userID
 	}
-	s := kagent.Session{ID: uuid.NewString(), Revision: f.revision}
-	f.sessions[requestID], f.owners[s.ID] = s, userID
+	if f.unpinned {
+		return kagent.Session{ID: s.ID}, fmt.Errorf("%w: %w", kagent.ErrUnpinned, kagent.ErrRollout)
+	}
 	return s, nil
 }
 
@@ -151,6 +155,9 @@ func (f *fakeRemote) GetSession(_ context.Context, userID, id string) (kagent.Se
 	defer f.mu.Unlock()
 	if f.deleted[id] || f.owners[id] != userID {
 		return kagent.Session{}, kagent.ErrNotFound
+	}
+	if f.unpinned {
+		return kagent.Session{ID: id}, fmt.Errorf("%w: %w", kagent.ErrUnpinned, kagent.ErrRollout)
 	}
 	return kagent.Session{ID: id, Revision: f.revision, Deleting: f.deleting[id]}, nil
 }
@@ -739,6 +746,46 @@ func TestUnacknowledgedCreateIsRecoveredByIdempotentRetry(t *testing.T) {
 	}
 	if remote.count("create ") != 2 || remote.count("stream ") != 0 {
 		t.Fatalf("create was not retried idempotently: %v", remote.snapshotCalls())
+	}
+}
+
+func TestUnpinnedSessionIsOwnedAndDeletedOnRetirement(t *testing.T) {
+	// kagent v0 creates a session before the broker can pin the Agent's
+	// config. With no ready pod the session is kagent's all the same.
+	for _, recovered := range []bool{false, true} {
+		remote := newFakeRemote()
+		remote.unpinned = true
+		if recovered {
+			remote.createErr = []error{errors.New("unavailable")}
+		}
+		h := newHarness(t, remote)
+		o, p := testOwner(1), h.prompt("prompt-1")
+		if code := h.turn(o, p).Code; code != http.StatusServiceUnavailable {
+			t.Fatalf("recovered=%v: unpinned turn status = %d", recovered, code)
+		}
+		if !h.control(settlePath, o, p).SettlementProven {
+			t.Fatalf("recovered=%v: undispatched prompt did not settle", recovered)
+		}
+		if !recovered {
+			// Once the Agent runs one ready pod again the owned session is used.
+			remote.mu.Lock()
+			remote.unpinned = false
+			remote.mu.Unlock()
+			remote.streams = append(remote.streams, completedStream(remote, "task-1", "ok"))
+			if code := h.turn(o, h.prompt("prompt-2")).Code; code != http.StatusOK {
+				t.Fatalf("turn after the pin returned = %d", code)
+			}
+		}
+		creates, streams := 1, 1
+		if recovered {
+			creates, streams = 2, 0
+		}
+		if !h.control(retirePath, o, nil).RetirementProven || remote.count("delete ") != 1 || remote.count("create ") != creates {
+			t.Fatalf("recovered=%v: the unpinned session was not owned and deleted: %v", recovered, remote.snapshotCalls())
+		}
+		if remote.count("stream ") != streams {
+			t.Fatalf("recovered=%v: a message was sent while the session was unpinned: %v", recovered, remote.snapshotCalls())
+		}
 	}
 }
 

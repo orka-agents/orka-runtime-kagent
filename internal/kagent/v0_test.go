@@ -149,6 +149,27 @@ func TestV0SessionsAreCreatedReadAndDeletedAsTheUser(t *testing.T) {
 	}
 }
 
+// A session kagent created is the broker's to delete even when the Agent's
+// config cannot be pinned, as when the Agent has no ready pod.
+func TestV0UnpinnedSessionIsStillReturned(t *testing.T) {
+	client, _ := newV0Test(t)
+	client.pin = fixedPin{err: ErrRollout}
+	ctx := context.Background()
+	session, err := client.CreateSession(ctx, "orka-user", "orka-session")
+	if !errors.Is(err, ErrUnpinned) || !errors.Is(err, ErrRollout) || session.ID != "orka-session" || session.Revision != "" {
+		t.Fatalf("unpinned CreateSession = %+v, %v", session, err)
+	}
+	if read, err := client.GetSession(ctx, "orka-user", "orka-session"); !errors.Is(err, ErrUnpinned) || read.Revision != "" {
+		t.Fatalf("unpinned GetSession = %+v, %v", read, err)
+	}
+	if err := client.DeleteSession(ctx, "orka-user", "orka-session"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetSession(ctx, "orka-user", "orka-session"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a deleted unpinned session read as %v", err)
+	}
+}
+
 func TestV0CreateRefusalsAreNeverDefinite(t *testing.T) {
 	client, controller := newV0Test(t)
 	ctx := context.Background()

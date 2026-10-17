@@ -79,7 +79,10 @@ func (b *lifecycleBroker) reconcile(ctx context.Context, key string) {
 // creation. Only kagent's answer moves the session out of intent.
 func (b *lifecycleBroker) resolveCreate(ctx context.Context, key string, s *session) bool {
 	remoteSession, err := b.remote.CreateSession(ctx, s.UserID, s.RequestID)
-	if err != nil && !errors.Is(err, kagent.ErrRejected) {
+	// An unpinned session is still kagent's, so it is owned and can be
+	// retired; dispatch pins it again first.
+	unpinned := errors.Is(err, kagent.ErrUnpinned) && remoteSession.ID != ""
+	if err != nil && !unpinned && !errors.Is(err, kagent.ErrRejected) {
 		return false
 	}
 	b.mu.Lock()
@@ -89,7 +92,11 @@ func (b *lifecycleBroker) resolveCreate(ctx context.Context, key string, s *sess
 		if current == nil || current.CreateState != createIntent {
 			return errPending
 		}
-		if err != nil {
+		switch {
+		case unpinned:
+			current.CreateState, current.RemoteID = createKnown, remoteSession.ID
+			return nil
+		case err != nil:
 			// A definite refusal created nothing.
 			current.CreateState = createNone
 			return nil

@@ -446,6 +446,11 @@ func (b *lifecycleBroker) ensureRemote(ctx context.Context, key string) (*sessio
 		case state == createIntent && errors.Is(err, kagent.ErrRejected):
 			current.CreateState = createNone
 			return nil
+		case state == createIntent && errors.Is(err, kagent.ErrUnpinned) && observed.ID != "":
+			// kagent holds the session, so own it for retirement; only a
+			// later read that pins the revision lets a message through.
+			current.CreateState, current.RemoteID = createKnown, observed.ID
+			return nil
 		case state == createKnown && errors.Is(err, kagent.ErrNotFound):
 			current.RemoteGone = true
 			return nil
