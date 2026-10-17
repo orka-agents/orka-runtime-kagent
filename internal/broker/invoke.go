@@ -282,7 +282,9 @@ func (b *lifecycleBroker) awaitTerminal(ctx context.Context, userID string, task
 	}
 }
 
-// taskText joins the task's text artifacts, skipping tool activity.
+// taskText joins the task's text artifacts, skipping tool activity. kagent
+// replaces the answer of an Agent with an output schema by a structured JSON
+// part, which is reported as its JSON text, as kagent's own CLI does.
 func taskText(task *a2atype.Task) (string, bool) {
 	var builder strings.Builder
 	for _, artifact := range task.Artifacts {
@@ -292,6 +294,14 @@ func taskText(task *a2atype.Task) (string, bool) {
 		var run strings.Builder
 		for _, part := range artifact.Parts {
 			if _, tool := kagent.ToolActivity(part); tool || part == nil {
+				continue
+			}
+			if apia2a.IsStructuredOutputPart(part) {
+				text, err := apia2a.StructuredOutputJSON(part)
+				if err != nil {
+					return "", false
+				}
+				run.WriteString(text)
 				continue
 			}
 			run.WriteString(part.Text())

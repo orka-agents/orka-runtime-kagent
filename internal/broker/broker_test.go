@@ -507,6 +507,24 @@ func completedStream(remote *fakeRemote, taskID a2atype.TaskID, text string) fun
 	}
 }
 
+// kagent v1 replaces the answer of an Agent with an output schema by a
+// structured JSON part, with no text beside it.
+func TestTaskTextReportsStructuredOutputAsJSON(t *testing.T) {
+	task := &a2atype.Task{Artifacts: []*a2atype.Artifact{
+		{Parts: []*a2atype.Part{apia2a.NewToolCallPart("call-1", "probe", map[string]any{})}},
+		{Parts: []*a2atype.Part{apia2a.NewStructuredOutputPart(map[string]any{"answer": 42}, strings.Repeat("a", 64))}},
+	}}
+	if text, ok := taskText(task); !ok || text != `{"answer":42}` {
+		t.Fatalf("taskText = %q, %v", text, ok)
+	}
+	// Ordinary data that is neither a tool part nor a structured answer is
+	// still not text.
+	task.Artifacts[1].Parts = []*a2atype.Part{a2atype.NewDataPart(map[string]any{"answer": 42})}
+	if text, ok := taskText(task); !ok || text != "" {
+		t.Fatalf("taskText of plain data = %q, %v", text, ok)
+	}
+}
+
 func TestTurnStreamsObservedToolsAndSettlesThenRetiresWithProof(t *testing.T) {
 	remote := newFakeRemote()
 	remote.streams = append(remote.streams, completedStream(remote, "task-1", "probe-done"))
