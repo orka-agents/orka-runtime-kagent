@@ -346,7 +346,7 @@ only the config hash at run time.
               matchLabels: {app.kubernetes.io/name: kagent, app.kubernetes.io/component: controller}
         ports: [{port: 8080, protocol: TCP}]
   ---
-  # Controller API: only the Agents' callbacks and the brokers.
+  # Controller API: the Agents, which kagent points at it, and the brokers.
   apiVersion: networking.k8s.io/v1
   kind: NetworkPolicy
   metadata: {name: kagent-controller-ingress, namespace: kagent}
@@ -381,6 +381,16 @@ only the config hash at run time.
 
   Label each wrapper pod `orka.ai/kagent-broker: "true"`. Turn off kagent's
   UI or keep it off this network: it calls the controller as any user.
+- **Code in Agent pods.** The controller policy cannot narrow what Agent pods
+  call. kagent v0 points every Agent at the controller Service itself, so
+  unlike v1's `controlPlaneUrl` there is no place for a filtering proxy, and
+  the session and task routes the runtime needs accept any `X-User-Id`.
+  Anything in an Agent pod that reaches the controller can therefore act as
+  any user, including the users of other Orka sessions. kagent runs the
+  model's skill commands and code blocks in a sandbox that has no network
+  unless the Agent sets `spec.sandbox.network.allowedDomains`. The import
+  refuses such Agents in either mode. Add nothing else to Agent pods that
+  could reach the controller.
 - **Broker access to the Agent's pods.** The broker lists the Agent's pods
   with its pod's service account. Grant `get` and `list` on `pods` in the
   Agent's namespace, and mount a token into the broker container only:
