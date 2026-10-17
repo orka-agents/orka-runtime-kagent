@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
 
@@ -49,6 +50,9 @@ type fakeV0Controller struct {
 	agentID  string
 	a2a      []*http.Request
 	methods  []string
+	// event is the session's latest event, which kagent returns with the
+	// session unless the read asks only for later events.
+	event string
 }
 
 func (f *fakeV0Controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -87,7 +91,11 @@ func (f *fakeV0Controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			reply(http.StatusOK, nil)
 			return
 		}
-		reply(http.StatusOK, map[string]any{"session": map[string]string{"id": id, "user_id": user, "agent_id": f.agentID}})
+		data := map[string]any{"session": map[string]string{"id": id, "user_id": user, "agent_id": f.agentID}}
+		if after, err := time.Parse(time.RFC3339, r.URL.Query().Get("after")); f.event != "" && (err != nil || after.Before(time.Now())) {
+			data["events"] = []map[string]string{{"data": f.event}}
+		}
+		reply(http.StatusOK, data)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/a2a/kagent/probe-v0/":
 		var rpc struct {
 			ID     any    `json:"id"`
@@ -146,6 +154,22 @@ func TestV0SessionsAreCreatedReadAndDeletedAsTheUser(t *testing.T) {
 	}
 	if _, err := client.GetSession(ctx, "orka-user", "orka-session"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("a deleted session read as %v", err)
+	}
+}
+
+// A session read carries no events, so a large one cannot make the session
+// unreadable.
+func TestV0SessionReadSkipsLargeEvents(t *testing.T) {
+	client, controller := newV0Test(t)
+	ctx := context.Background()
+	if _, err := client.CreateSession(ctx, "orka-user", "orka-session"); err != nil {
+		t.Fatal(err)
+	}
+	controller.mu.Lock()
+	controller.event = strings.Repeat("x", maxV0ResponseBytes)
+	controller.mu.Unlock()
+	if read, err := client.GetSession(ctx, "orka-user", "orka-session"); err != nil || read.ID != "orka-session" {
+		t.Fatalf("GetSession after a large event = %+v, %v", read, err)
 	}
 }
 

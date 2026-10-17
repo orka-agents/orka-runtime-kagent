@@ -32,6 +32,11 @@ const (
 	serviceAccountDir      = "/var/run/secrets/kubernetes.io/serviceaccount"
 )
 
+// v0SessionOnly reads a session without its events. kagent answers a session
+// read with the session's events too, and one event can be larger than the
+// whole reply the client accepts; it lists only events created after "after".
+const v0SessionOnly = "?limit=1&after=9999-12-31T23:59:59Z"
+
 var v0ConfigHash = regexp.MustCompile(`^(0|[1-9][0-9]{0,19})$`)
 
 // ErrRollout reports that the Agent does not run as exactly one ready pod.
@@ -135,7 +140,7 @@ func (c *V0Client) GetSession(ctx context.Context, userID, id string) (Session, 
 			Session *v0Session `json:"session"`
 		} `json:"data"`
 	}
-	status, err := c.do(ctx, http.MethodGet, "/api/sessions/"+url.PathEscape(id)+"?limit=1", userID, nil, &envelope)
+	status, err := c.do(ctx, http.MethodGet, "/api/sessions/"+url.PathEscape(id)+v0SessionOnly, userID, nil, &envelope)
 	switch {
 	case err != nil:
 		return Session{}, err
