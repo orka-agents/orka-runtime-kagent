@@ -322,7 +322,10 @@ where this section says otherwise.
 ### What the v0 install must look like
 
 Run wrapped Agents in a dedicated kagent install, as for v1, with the Go
-runtime (`declarative.runtime: go`) and one replica.
+runtime (`declarative.runtime: go`) and one replica. Only kagent's controller
+may change the Agents' Deployments: the import checks that each Deployment
+loads its compiled configuration as kagent renders it, but the broker pins
+only the config hash at run time.
 
 - **Isolation.** v0 ships no NetworkPolicies, its default `unsecure` auth mode
   accepts any `X-User-Id`, and its authorization is a no-op. Without these
