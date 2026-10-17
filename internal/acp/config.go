@@ -24,7 +24,10 @@ const (
 	providerTokenEnv   = "ORKA_KAGENT_ACP_PROVIDER_TOKEN"
 	acpMaxMessageBytes = 8 << 20
 	maxPromptBytes     = 4 << 20
-	acpTextChunkBytes  = 32 << 10
+	// maxProviderRequestBytes is the broker's request limit. Escaping and the
+	// MCP descriptor make the encoded request longer than the prompt text.
+	maxProviderRequestBytes = 4 << 20
+	acpTextChunkBytes       = 32 << 10
 	// The broker sends a keepalive every 15s; a longer silence means the
 	// relay is gone.
 	streamIdleTimeout     = 90 * time.Second

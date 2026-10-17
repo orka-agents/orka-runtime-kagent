@@ -297,6 +297,21 @@ func TestGovernedSessionRequiresWhatTheBrokerRelays(t *testing.T) {
 	}
 }
 
+// JSON escaping can make a prompt within the text limit encode past the
+// broker's request limit; the child refuses it as invalid instead of letting
+// the broker answer an anonymous 400.
+func TestOversizedEncodedPromptIsInvalid(t *testing.T) {
+	called := false
+	p := newPeer(t, func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusBadRequest)
+	}, "")
+	failure, _ := p.reply(p.prompt(strings.Repeat("<", 1<<20)))["error"].(map[string]any)
+	if failure["code"] != float64(-32602) || called {
+		t.Fatalf("oversized prompt = %v, broker called %v", failure, called)
+	}
+}
+
 func TestBrokerRefusalSurfacesItsCode(t *testing.T) {
 	p := newPeer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

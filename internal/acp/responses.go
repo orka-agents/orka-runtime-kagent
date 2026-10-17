@@ -62,6 +62,9 @@ func (s *acpServer) runPrompt(ctx context.Context, session *acpSession, text str
 	if err != nil {
 		return err
 	}
+	if len(body) > maxProviderRequestBytes {
+		return acpInvalidParams
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.providerURL, bytes.NewReader(body))
