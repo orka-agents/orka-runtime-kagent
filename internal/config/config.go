@@ -42,6 +42,7 @@ var (
 	revision     = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	configHash   = regexp.MustCompile(`^(0|[1-9][0-9]{0,19})$`)
 	userIDPrefix = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$`)
+	gitCommit    = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 )
 
 // Agent is the frozen, digest-pinned description of one wrapped kagent Agent.
@@ -53,6 +54,11 @@ type Agent struct {
 	// model through the broker's relay. The approved revision must point
 	// every MCP binding and model endpoint at that relay.
 	Governed *Governed `json:"governed,omitempty"`
+	// Unreachable lists host:port addresses the broker must fail to connect
+	// to, such as Substrate's actor router or kagent's database. The install
+	// is expected to admit only kagent's controller to them; the broker
+	// stops admitting work while it can reach one.
+	Unreachable []string `json:"unreachable,omitempty"`
 }
 
 // Governed names the model endpoint the relay calls with Orka's credential.
@@ -61,6 +67,9 @@ type Governed struct {
 	UpstreamBaseURL string `json:"upstreamBaseURL"`
 	// UpstreamModel replaces whatever model the kagent Agent asks for.
 	UpstreamModel string `json:"upstreamModel"`
+	// MaxOutputTokens, when positive, bounds every model call's output. The
+	// relay lowers or sets the request's output limit to it.
+	MaxOutputTokens int64 `json:"maxOutputTokens,omitempty"`
 }
 
 // Kagent versions the adapter supports.
@@ -84,8 +93,17 @@ type Kagent struct {
 	// kagent.dev/config-hash of the Agent's Deployment: a hash of its compiled
 	// config, agent card, and secrets. Anything else is refused before dispatch.
 	ExpectedRevision string `json:"expectedRevision"`
+	// ExpectedImageDigest pins the image a v0 Agent's pod runs, as its
+	// container status reports it ("sha256:<hex>"). kagent's config hash does
+	// not cover the image. It is required for v0 and unused for v1.
+	ExpectedImageDigest string `json:"expectedImageDigest,omitempty"`
 	// UserIDPrefix prefixes the per-Orka-session kagent user identity.
 	UserIDPrefix string `json:"userIDPrefix"`
+	// AcceptedCommits adds kagent controller builds, by git commit, that the
+	// operator has verified with the release gate. The broker refuses work
+	// on any controller build that is neither one of these nor one this
+	// release was verified against.
+	AcceptedCommits []string `json:"acceptedCommits,omitempty"`
 }
 
 // KagentVersion returns the kagent API generation, defaulting to KagentV1.
@@ -133,10 +151,26 @@ func Decode(data []byte, digest, model string) (Agent, error) {
 	pin := revision
 	switch k.Version {
 	case "", KagentV1:
+		if k.ExpectedImageDigest != "" {
+			return Agent{}, ErrConfig
+		}
 	case KagentV0:
 		pin = configHash
+		if !DigestValid(k.ExpectedImageDigest) {
+			return Agent{}, ErrConfig
+		}
 	default:
 		return Agent{}, ErrConfig
+	}
+	for _, commit := range k.AcceptedCommits {
+		if !gitCommit.MatchString(commit) {
+			return Agent{}, ErrConfig
+		}
+	}
+	for _, address := range agent.Unreachable {
+		if !HostPort(address) {
+			return Agent{}, ErrConfig
+		}
 	}
 	if _, err := ControlPlaneURL(k.ControlPlaneURL); err != nil ||
 		!dnsLabel.MatchString(k.Agent.Namespace) || len(k.Agent.Namespace) > 63 ||
@@ -146,7 +180,7 @@ func Decode(data []byte, digest, model string) (Agent, error) {
 	}
 	if g := agent.Governed; g != nil {
 		if _, err := UpstreamBaseURL(g.UpstreamBaseURL); err != nil || !SafeString(g.UpstreamModel, 256) ||
-			strings.TrimSpace(g.UpstreamModel) != g.UpstreamModel {
+			strings.TrimSpace(g.UpstreamModel) != g.UpstreamModel || g.MaxOutputTokens < 0 {
 			return Agent{}, ErrConfig
 		}
 	}
@@ -200,6 +234,20 @@ func ControlPlaneURL(value string) (*url.URL, error) {
 	}
 	u.Path = ""
 	return u, nil
+}
+
+// HostPort reports whether value is a DNS name or IP address with an explicit
+// port, such as "kagent-postgresql.kagent.svc:5432".
+func HostPort(value string) bool {
+	host, port, err := net.SplitHostPort(value)
+	if err != nil || !SafeString(value, 512) || strings.TrimSpace(value) != value {
+		return false
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
+		return false
+	}
+	return net.ParseIP(host) != nil || dnsSubdomain.MatchString(host)
 }
 
 // SafeString reports whether value is nonempty, at most limit bytes, and free

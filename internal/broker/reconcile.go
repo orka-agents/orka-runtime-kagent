@@ -76,8 +76,31 @@ func (b *lifecycleBroker) reconcile(ctx context.Context, key string) {
 }
 
 // resolveCreate retries the idempotent CreateSession for an unacknowledged
-// creation. Only kagent's answer moves the session out of intent.
+// creation. Only kagent's answer moves the session out of intent, except for
+// a retiring session whose ID is known in advance (kagent v0): once no create
+// can still commit, deleting that ID and reading it gone proves no session is
+// left. That matters when the Agent is deleted, because v0 then refuses every
+// create without saying whether an earlier one committed.
 func (b *lifecycleBroker) resolveCreate(ctx context.Context, key string, s *session) bool {
+	if id, known := b.remote.SessionIDForRequest(s.RequestID); known && s.Retiring && !s.CreateAttemptAt.IsZero() {
+		if b.cfg.now().Sub(s.CreateAttemptAt) < v0CreateSettle {
+			return false
+		}
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return b.commitLocked(false, func(next *ledger) error {
+			current := next.Sessions[key]
+			if current == nil || current.CreateState != createIntent || !current.CreateAttemptAt.Equal(s.CreateAttemptAt) {
+				return errPending
+			}
+			// retire deletes the session by this ID and requires it gone.
+			current.CreateState, current.RemoteID = createKnown, id
+			return nil
+		}) == nil
+	}
+	if !b.stampCreateAttempt(key) {
+		return false
+	}
 	remoteSession, err := b.remote.CreateSession(ctx, s.UserID, s.RequestID)
 	// An unpinned session is still kagent's, so it is owned and can be
 	// retired; dispatch pins it again first.
@@ -103,6 +126,20 @@ func (b *lifecycleBroker) resolveCreate(ctx context.Context, key string, s *sess
 		}
 		current.CreateState, current.RemoteID, current.Revision = createKnown, remoteSession.ID, remoteSession.Revision
 		current.RevisionMismatch = remoteSession.Revision != b.cfg.expectedRevision
+		return nil
+	}) == nil
+}
+
+// stampCreateAttempt records that a session create is about to be sent.
+func (b *lifecycleBroker) stampCreateAttempt(key string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.commitLocked(false, func(next *ledger) error {
+		current := next.Sessions[key]
+		if current == nil || current.CreateState != createIntent {
+			return errPending
+		}
+		current.CreateAttemptAt = b.cfg.now()
 		return nil
 	}) == nil
 }
@@ -159,6 +196,9 @@ func (b *lifecycleBroker) settlePrompt(ctx context.Context, key string, s *sessi
 // reports a deleted session's tasks as unauthorized, not missing, so any failed
 // task read falls back to asking whether the session itself is gone.
 func (b *lifecycleBroker) resolveInvocation(ctx context.Context, s *session, inv *invocation) (string, bool) {
+	if inv.Unbound && b.cfg.kagentV0 {
+		return b.fenceV0(ctx, s, inv)
+	}
 	if inv.State == invocationIntent {
 		// Absence is never proof: kagent's admission latency is unbounded.
 		// Waiting out its dispatch fence gives an admitted send time to
@@ -245,7 +285,9 @@ func (b *lifecycleBroker) fenceV0(ctx context.Context, s *session, inv *invocati
 	if !b.sessionDeleted(ctx, s) {
 		return "", false
 	}
-	if b.cfg.governed != nil {
+	// An unbound send may have reached a pod on a config that never uses
+	// the turn token, so only the pods' replacement proves it stopped.
+	if b.cfg.governed != nil && !inv.Unbound {
 		inv.State = invocationSettled
 		return proofTurnTokenRevoked, true
 	}

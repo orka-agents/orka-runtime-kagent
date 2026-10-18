@@ -82,6 +82,7 @@ func TestDecodeAcceptsGovernedUpstream(t *testing.T) {
 
 func TestDecodePinsEachKagentVersionItsOwnWay(t *testing.T) {
 	v1Revision := "c85fb79c49c56d3720b2744f8e330d1cbe5f18fe84ad407f060043677716806f"
+	const v0 = `"version":"v0","expectedImageDigest":"sha256:5ee9592cb7d959538d0f0fe36acf31ba3a06de084f84048b1459c3bdfafcda1f",`
 	for _, test := range []struct {
 		name, version, revision string
 		ok                      bool
@@ -89,10 +90,13 @@ func TestDecodePinsEachKagentVersionItsOwnWay(t *testing.T) {
 	}{
 		{"v1 by default", "", v1Revision, true, KagentV1},
 		{"explicit v1", `"version":"v1",`, v1Revision, true, KagentV1},
-		{"v0 config hash", `"version":"v0",`, "15270541297416117040", true, KagentV0},
-		{"v0 with a v1 revision", `"version":"v0",`, v1Revision, false, ""},
+		{"v0 config hash", v0, "15270541297416117040", true, KagentV0},
+		{"v0 with a v1 revision", v0, v1Revision, false, ""},
 		{"v1 with a config hash", "", "15270541297416117040", false, ""},
-		{"v0 with a leading zero", `"version":"v0",`, "0123", false, ""},
+		{"v0 with a leading zero", v0, "0123", false, ""},
+		{"v0 without an image", `"version":"v0",`, "15270541297416117040", false, ""},
+		{"v0 with a bad image", strings.Replace(v0, "sha256:5ee9", "5ee9", 1), "15270541297416117040", false, ""},
+		{"v1 with an image", `"expectedImageDigest":"sha256:5ee9592cb7d959538d0f0fe36acf31ba3a06de084f84048b1459c3bdfafcda1f",`, v1Revision, false, ""},
 		{"unknown version", `"version":"v2",`, v1Revision, false, ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -103,6 +107,30 @@ func TestDecodePinsEachKagentVersionItsOwnWay(t *testing.T) {
 			}
 			if test.ok && agent.Kagent.KagentVersion() != test.want {
 				t.Fatalf("version = %q, want %q", agent.Kagent.KagentVersion(), test.want)
+			}
+		})
+	}
+}
+
+func TestDecodeChecksGuardsAndLimits(t *testing.T) {
+	for _, test := range []struct {
+		name, replace, with string
+		ok                  bool
+	}{
+		{"accepted commits", `"userIDPrefix":"orka"`, `"userIDPrefix":"orka","acceptedCommits":["1eb89fb","8878c39d0c1e"]`, true},
+		{"short commit", `"userIDPrefix":"orka"`, `"userIDPrefix":"orka","acceptedCommits":["1eb89f"]`, false},
+		{"uppercase commit", `"userIDPrefix":"orka"`, `"userIDPrefix":"orka","acceptedCommits":["1EB89FB"]`, false},
+		{"unreachable addresses", `"kagent":{`, `"unreachable":["kagent-postgresql.kagent.svc:5432","10.0.0.7:8080"],"kagent":{`, true},
+		{"unreachable without a port", `"kagent":{`, `"unreachable":["kagent-postgresql.kagent.svc"],"kagent":{`, false},
+		{"unreachable bad port", `"kagent":{`, `"unreachable":["router:0"],"kagent":{`, false},
+		{"unreachable padded port", `"kagent":{`, `"unreachable":["router:080"],"kagent":{`, false},
+		{"output limit", `"kagent":{`, `"governed":{"upstreamBaseURL":"http://model.orka.svc/v1","upstreamModel":"m","maxOutputTokens":4096},"kagent":{`, true},
+		{"negative output limit", `"kagent":{`, `"governed":{"upstreamBaseURL":"http://model.orka.svc/v1","upstreamModel":"m","maxOutputTokens":-1},"kagent":{`, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := []byte(strings.Replace(validConfig, test.replace, test.with, 1))
+			if _, err := Decode(data, Digest(data), "kagent/kagent/probe"); (err == nil) != test.ok {
+				t.Fatalf("Decode = %v, want ok %v", err, test.ok)
 			}
 		})
 	}

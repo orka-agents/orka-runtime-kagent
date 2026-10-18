@@ -85,8 +85,12 @@ type session struct {
 	// expiring. A gone session never dispatches again.
 	RemoteGone  bool   `json:"remoteGone,omitempty"`
 	CreateState string `json:"createState"`
-	Retiring    bool   `json:"retiring"`
-	Retired     bool   `json:"retired"`
+	// CreateAttemptAt is when the latest session create was sent. kagent v0
+	// cannot commit a create once its request has ended, so after
+	// v0CreateSettle no unacknowledged create can still make a session.
+	CreateAttemptAt time.Time `json:"createAttemptAt,omitzero"`
+	Retiring        bool      `json:"retiring"`
+	Retired         bool      `json:"retired"`
 	// RetiredAt starts the retention period after which the record is pruned.
 	RetiredAt   time.Time `json:"retiredAt,omitzero"`
 	ProofDigest string    `json:"proofDigest,omitempty"`
@@ -124,6 +128,11 @@ type invocation struct {
 	FencedAt   time.Time `json:"fencedAt,omitzero"`
 	FencedPods []string  `json:"fencedPods,omitempty"`
 	Terminal   string    `json:"terminal,omitempty"`
+	// Unbound records that kagent v0's pinned pod was replaced while the send
+	// was in flight, so which pod runs the task is unknown. Its task's state,
+	// and a cancel answered by whichever pod is current, prove nothing: it
+	// settles only as a fenced send.
+	Unbound bool `json:"unbound,omitempty"`
 }
 
 type store struct {

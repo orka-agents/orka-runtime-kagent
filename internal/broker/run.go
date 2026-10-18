@@ -67,7 +67,8 @@ func Run(args []string, getenv func(string) string) error {
 	cfg := settings{
 		bearer: bearer, configDigest: getenv(config.ConfigDigestEnv), stateDir: stateDir, model: agent.Model,
 		expectedRevision: agent.Kagent.ExpectedRevision, userIDPrefix: agent.Kagent.UserIDPrefix,
-		kagentV0: agent.Kagent.KagentVersion() == config.KagentV0,
+		kagentV0:    agent.Kagent.KagentVersion() == config.KagentV0,
+		unreachable: agent.Unreachable,
 	}
 	relayAddr := ""
 	if g := agent.Governed; g != nil {
@@ -76,7 +77,8 @@ func Run(args []string, getenv func(string) string) error {
 		if err != nil || len(token) < 16 || strings.ContainsFunc(token, func(r rune) bool { return r <= ' ' || r == 0x7f }) {
 			return config.ErrConfig
 		}
-		cfg.governed = &governedSettings{UpstreamBaseURL: base, UpstreamModel: g.UpstreamModel, UpstreamToken: token}
+		cfg.governed = &governedSettings{UpstreamBaseURL: base, UpstreamModel: g.UpstreamModel, UpstreamToken: token,
+			MaxOutputTokens: g.MaxOutputTokens}
 		if relayAddr = getenv(relayAddrEnv); relayAddr == "" {
 			relayAddr = defaultRelayAddr
 		}
@@ -98,6 +100,8 @@ func Run(args []string, getenv func(string) string) error {
 		return err
 	}
 	defer b.close()
+	// Report an unsupported install at startup, not only at the first turn.
+	go func() { _ = b.admit(ctx) }()
 	errs := make(chan error, 2)
 	if relayListener != nil {
 		relay := &http.Server{

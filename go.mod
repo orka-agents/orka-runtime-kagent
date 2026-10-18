@@ -6,14 +6,15 @@ toolchain go1.27.2
 
 require (
 	github.com/a2aproject/a2a-go/v2 v2.6.0
+	github.com/google/uuid v1.6.0
 	github.com/kagent-dev/kagent/go v0.0.0-20261015233236-1eb89fb1b670
 	google.golang.org/grpc v1.84.0
 )
 
 require (
 	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260825204119-511051f7f437.2 // indirect
+	github.com/a2aproject/a2a-go v0.3.15 // indirect
 	github.com/agent-substrate/substrate v0.0.0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	golang.org/x/mod v0.42.0 // indirect
 	golang.org/x/net v0.61.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect

@@ -44,6 +44,8 @@ var (
 	// ErrAmbiguous reports that kagent's public view cannot prove whether a
 	// message created a task.
 	ErrAmbiguous = errors.New("kagent task lookup is ambiguous")
+	// ErrNotSent reports that a send failed before anything reached kagent.
+	ErrNotSent = errors.New("kagent send was not made")
 )
 
 // Session is the subset of a kagent Session the broker relies on.
@@ -62,6 +64,7 @@ type Client struct {
 	a2a      a2apb.A2AServiceClient
 	agent    *apiv1.ResourceReference
 	url      string
+	accepted []string
 }
 
 // a2aAccess runs the A2A calls both kagent versions share. open builds a
@@ -100,8 +103,9 @@ func New(cfg config.Kagent) (*Client, error) {
 	}
 	c := &Client{
 		conn: conn, sessions: apiv1.NewSessionServiceClient(conn), a2a: a2apb.NewA2AServiceClient(conn),
-		agent: &apiv1.ResourceReference{Namespace: cfg.Agent.Namespace, Name: cfg.Agent.Name},
-		url:   base.String(),
+		agent:    &apiv1.ResourceReference{Namespace: cfg.Agent.Namespace, Name: cfg.Agent.Name},
+		url:      base.String(),
+		accepted: cfg.AcceptedCommits,
 	}
 	c.a2aAccess = a2aAccess{open: c.a2aClientWith, callTimeout: defaultCallTimeout}
 	return c, nil
@@ -109,6 +113,21 @@ func New(cfg config.Kagent) (*Client, error) {
 
 // Close releases the connection.
 func (c *Client) Close() error { return c.conn.Close() }
+
+// SessionIDForRequest reports that v1 assigns session IDs itself.
+func (c *Client) SessionIDForRequest(string) (string, bool) { return "", false }
+
+// CheckVersion refuses a controller build this release was not verified
+// against and the configuration does not accept.
+func (c *Client) CheckVersion(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, c.callTimeout)
+	defer cancel()
+	version, err := apiv1.NewSystemServiceClient(c.conn).GetVersion(ctx, &apiv1.GetVersionRequest{})
+	if err != nil {
+		return classifyRPC(err)
+	}
+	return verifiedBuild(config.KagentV1, version.GetGitCommit(), c.accepted)
+}
 
 func (c *Client) call(ctx context.Context, userID string) (context.Context, context.CancelFunc) {
 	ctx = metadata.AppendToOutgoingContext(ctx, userIDHeader, userID)
@@ -338,9 +357,13 @@ func classifyA2A(err error) error {
 	return classifyRPC(err)
 }
 
-// NotAccepted reports kagent's explicit proof that a send was never accepted
-// and its input never persisted, so the same message may be retried safely.
+// NotAccepted reports proof that a send was never accepted and its input
+// never persisted, so the same message may be retried safely: the send was
+// never made, or kagent said it did not accept it.
 func NotAccepted(err error) bool {
+	if errors.Is(err, ErrNotSent) {
+		return true
+	}
 	var protocolError *a2atype.Error
 	if !errors.Is(err, a2atype.ErrUnsupportedOperation) || !errors.As(err, &protocolError) {
 		return false

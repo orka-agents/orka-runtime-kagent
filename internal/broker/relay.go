@@ -167,6 +167,14 @@ type tokenUsage struct {
 	reported, cached      bool
 }
 
+func (u *tokenUsage) add(input, output, cached uint64, hasCached bool) {
+	u.Input += input
+	u.Output += output
+	u.Cached += cached
+	u.reported = true
+	u.cached = u.cached || hasCached
+}
+
 // valid accepts only the pod-local Orka MCP server with a bearer header.
 func (m relayMCP) valid() bool { return config.SessionMCPServer(m.URL, m.Authorization) }
 
@@ -465,6 +473,10 @@ func (b *lifecycleBroker) serveModelRelay(downstream http.ResponseWriter, r *htt
 		return
 	}
 	payload["model"], _ = json.Marshal(b.cfg.governed.UpstreamModel)
+	if limit := b.cfg.governed.MaxOutputTokens; limit > 0 && !clampOutputTokens(payload, limit) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	var stream bool
 	_ = json.Unmarshal(payload["stream"], &stream)
 	if stream {
@@ -506,6 +518,34 @@ func (b *lifecycleBroker) serveModelRelay(downstream http.ResponseWriter, r *htt
 		// failed response instead of a clean but truncated one.
 		panic(http.ErrAbortHandler)
 	}
+}
+
+// outputLimitFields are the chat completion fields that bound output, in the
+// order Orka's provider proxy reads them; the first is set when neither is.
+var outputLimitFields = []string{"max_tokens", "max_completion_tokens"}
+
+// clampOutputTokens bounds a chat completion's output at limit, as Orka's
+// provider proxy does: the request keeps one output limit field, set to the
+// smaller of limit and what it asked for. It refuses a field that is not a
+// positive integer.
+func clampOutputTokens(payload map[string]json.RawMessage, limit int64) bool {
+	field := outputLimitFields[0]
+	for _, name := range outputLimitFields {
+		raw, ok := payload[name]
+		if !ok {
+			continue
+		}
+		var asked int64
+		if json.Unmarshal(raw, &asked) != nil || asked <= 0 {
+			return false
+		}
+		field, limit = name, min(limit, asked)
+	}
+	for _, name := range outputLimitFields {
+		delete(payload, name)
+	}
+	payload[field], _ = json.Marshal(limit)
+	return true
 }
 
 // relayCopy streams the upstream body and reads usage from each complete

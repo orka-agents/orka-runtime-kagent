@@ -11,6 +11,7 @@ import (
 	"io"
 	"iter"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -38,6 +39,16 @@ const (
 	// Orka records retirement durably once proven, so a retired record is
 	// kept only long enough to answer retried retire calls.
 	defaultRetiredRetention = 24 * time.Hour
+	// v0CreateSettle bounds how long a kagent v0 session create can still
+	// commit after it was sent. The controller looks up the Agent and stores
+	// the session on the request's context. Go's server cancels that context
+	// when the broker's call (at most defaultCallTimeout) closes its
+	// connection, or, if a partition hides the close, when its TCP keep-alives
+	// give up on the connection, about 2.5 minutes later. The rest is margin
+	// for a database call in flight. A create stalled past this can still
+	// insert an empty session after retirement; it holds no task, and nothing
+	// sends to it.
+	v0CreateSettle = 5 * time.Minute
 )
 
 // agentPods is the kagent v0 client's view of the pods that run the Agent.
@@ -56,6 +67,11 @@ type remote interface {
 	GetTask(ctx context.Context, userID string, taskID a2atype.TaskID) (*a2atype.Task, error)
 	FindTaskByMessage(ctx context.Context, userID, contextID, messageID string) (*a2atype.Task, error)
 	CancelTask(ctx context.Context, userID string, taskID a2atype.TaskID) (*a2atype.Task, error)
+	// CheckVersion refuses a kagent controller build that is not verified.
+	CheckVersion(ctx context.Context) error
+	// SessionIDForRequest reports the session ID a create with requestID
+	// makes, when kagent creates sessions under the caller's ID (v0).
+	SessionIDForRequest(requestID string) (string, bool)
 }
 
 type settings struct {
@@ -77,10 +93,15 @@ type settings struct {
 	log              *slog.Logger
 	// governed is set when Orka executes the Agent's tools and serves its model.
 	governed *governedSettings
+	// unreachable lists addresses the broker must fail to connect to.
+	unreachable []string
+	dial        func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 type governedSettings struct {
 	UpstreamBaseURL, UpstreamModel, UpstreamToken string
+	// MaxOutputTokens, when positive, bounds every relayed model call.
+	MaxOutputTokens int64
 }
 
 type active struct {
@@ -103,6 +124,8 @@ type lifecycleBroker struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	admission admission
 
 	// Turn tokens authorize relayed calls; they live only in memory.
 	turnMu      sync.Mutex
@@ -135,6 +158,9 @@ func newLifecycleBroker(ctx context.Context, cfg settings, r remote) (*lifecycle
 	}
 	if cfg.log == nil {
 		cfg.log = slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	}
+	if cfg.dial == nil {
+		cfg.dial = (&net.Dialer{Timeout: unreachableDialTimeout}).DialContext
 	}
 	s, l, err := openStore(cfg.stateDir, cfg.configDigest)
 	if err != nil {

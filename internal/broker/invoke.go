@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -53,6 +54,8 @@ const (
 	failUnknown       = "kagent_outcome_unknown"
 	failRevision      = "kagent_revision_mismatch"
 	failSessionGone   = "kagent_session_gone"
+	failUnverified    = "kagent_build_unverified"
+	failIsolation     = "kagent_isolation_broken"
 )
 
 func (b *lifecycleBroker) serveResponses(w http.ResponseWriter, r *http.Request, c brokerContext, raw []byte) {
@@ -74,6 +77,18 @@ func (b *lifecycleBroker) serveResponses(w http.ResponseWriter, r *http.Request,
 	stopDisconnect := context.AfterFunc(r.Context(), func() { b.closePrompt(key, promptKey); cancel() })
 	defer stopDisconnect()
 
+	if err := b.admit(runCtx); err != nil {
+		b.finish(key, promptKey, c.InvocationSequence, nil)
+		switch {
+		case errors.Is(err, errUnverifiedBuild):
+			writeFailedJSON(w, failUnverified)
+		case errors.Is(err, errIsolation):
+			writeFailedJSON(w, failIsolation)
+		default:
+			writeError(w, errRemote)
+		}
+		return
+	}
 	s, err := b.ensureRemote(runCtx, key)
 	if err != nil {
 		b.finish(key, promptKey, c.InvocationSequence, nil)
@@ -143,14 +158,18 @@ func (b *lifecycleBroker) serveResponses(w http.ResponseWriter, r *http.Request,
 		text = text[n:]
 	}
 	completed := map[string]any{"id": responseID, "status": "completed"}
+	// A governed turn's usage is what the relay metered. An observed turn's
+	// model calls bypass Orka, so its usage is what kagent reported.
+	usage := outcome.kagentUsage
 	if turn != nil {
-		if usage := turn.totalUsage(); usage.reported {
-			reported := map[string]any{"input_tokens": usage.Input, "output_tokens": usage.Output}
-			if usage.cached {
-				reported["input_tokens_details"] = map[string]uint64{"cached_tokens": usage.Cached}
-			}
-			completed["usage"] = reported
+		usage = turn.totalUsage()
+	}
+	if usage.reported {
+		reported := map[string]any{"input_tokens": usage.Input, "output_tokens": usage.Output}
+		if usage.cached {
+			reported["input_tokens_details"] = map[string]uint64{"cached_tokens": usage.Cached}
 		}
+		completed["usage"] = reported
 	}
 	_ = stream.event("response.completed", map[string]any{"type": "response.completed", "response": completed})
 }
@@ -159,6 +178,8 @@ type turnOutcome struct {
 	invocation invocation
 	text       string
 	failure    string
+	// kagentUsage totals the token usage kagent reported on the turn's events.
+	kagentUsage tokenUsage
 }
 
 // runTurn sends the message once (retrying only kagent's explicit
@@ -188,11 +209,22 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 			out.failure = failUnknown
 			return out
 		}
-		notAccepted := false
+		notAccepted, pinLost := false, false
 		for event, err := range b.remote.Stream(streamCtx, s.UserID, s.RemoteID, messageID, text, authorization) {
 			if err != nil {
 				notAccepted = taskID == "" && kagent.NotAccepted(err)
+				var lost *kagent.PinLostError
+				if pinLost = errors.As(err, &lost); pinLost {
+					// Record that the send's pod is unknown, with any task kagent
+					// admitted, in one commit, before anything could read the
+					// task as evidence.
+					taskID = cmp.Or(taskID, lost.TaskID)
+					b.markUnbound(key, promptKey, sequence, string(taskID))
+				}
 				break
+			}
+			if usage, ok := kagent.EventUsage(event); ok {
+				out.kagentUsage.add(usage.Input, usage.Output, usage.Cached, usage.HasCached)
 			}
 			if id := event.TaskInfo().TaskID; id != "" && taskID == "" {
 				taskID = id
@@ -222,6 +254,17 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 		if notAccepted {
 			out.invocation.State = invocationRejected
 			out.failure = failTurn
+			return out
+		}
+		if pinLost {
+			// The pinned pod was replaced while the send was in flight, so the
+			// turn may run on another config, on a pod the broker cannot name.
+			// A cancel would reach whichever pod is current, so it proves
+			// nothing; settlement fences the session instead.
+			out.invocation.Unbound, out.failure = true, failRevision
+			if taskID != "" {
+				out.invocation.State, out.invocation.TaskID = invocationAccepted, string(taskID)
+			}
 			return out
 		}
 		break
@@ -330,6 +373,10 @@ func failureMessage(code string) string {
 		return "The kagent Agent revision does not match the approved revision."
 	case failSessionGone:
 		return "The kagent session was deleted or expired; this Orka session cannot continue."
+	case failUnverified:
+		return "The kagent controller build is not one this adapter was verified against."
+	case failIsolation:
+		return "The kagent install lets the adapter reach a component that should admit only kagent's controller."
 	default:
 		return "The kagent turn did not complete."
 	}
@@ -437,6 +484,9 @@ func (b *lifecycleBroker) ensureRemote(ctx context.Context, key string) (*sessio
 	var err error
 	switch state {
 	case createIntent:
+		if !b.stampCreateAttempt(key) {
+			return nil, errPending
+		}
 		observed, err = b.remote.CreateSession(ctx, userID, requestID)
 	case createKnown:
 		observed, err = b.remote.GetSession(ctx, userID, remoteID)
@@ -551,6 +601,7 @@ func (b *lifecycleBroker) finish(key, promptKey string, sequence uint64, result 
 				inv.State, inv.TaskID, inv.Terminal = invocationCompleted, result.TaskID, result.Terminal
 			case invocationAccepted:
 				inv.State, inv.TaskID = invocationAccepted, result.TaskID
+				inv.Unbound = inv.Unbound || result.Unbound
 			case invocationRejected:
 				if inv.State == invocationIntent {
 					inv.State = invocationRejected
@@ -560,6 +611,21 @@ func (b *lifecycleBroker) finish(key, promptKey string, sequence uint64, result 
 		})
 	}
 	delete(b.active, key)
+}
+
+// markUnbound records an admitted task whose pod is unknown.
+func (b *lifecycleBroker) markUnbound(key, promptKey string, sequence uint64, taskID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_ = b.commitLocked(false, func(next *ledger) error {
+		if inv := invocationFor(next, key, promptKey, sequence); inv != nil {
+			if inv.State == invocationIntent {
+				inv.State, inv.TaskID = invocationAccepted, taskID
+			}
+			inv.Unbound = true
+		}
+		return nil
+	})
 }
 
 func (b *lifecycleBroker) closePrompt(key, promptKey string) {

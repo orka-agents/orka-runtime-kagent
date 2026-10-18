@@ -64,8 +64,24 @@ type fakeRemote struct {
 	auth      string   // the authorization of the latest stream
 	// v0 models kagent v0.x: a deleted session's tasks stay readable and
 	// cancellable by ID, because deletion does not stop the Agent, but they can
-	// no longer be listed by session.
+	// no longer be listed by session. Sessions take the caller's ID.
 	v0 bool
+	// versionErr is what CheckVersion answers.
+	versionErr error
+	// createRefusal, when set, fails every CreateSession.
+	createRefusal error
+}
+
+func (f *fakeRemote) CheckVersion(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.versionErr
+}
+
+func (f *fakeRemote) SessionIDForRequest(requestID string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return requestID, f.v0
 }
 
 func (f *fakeRemote) lastAuthorization() string {
@@ -131,6 +147,9 @@ func (f *fakeRemote) CreateSession(_ context.Context, userID, requestID string) 
 	f.record("create " + userID + " " + requestID)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.createRefusal != nil {
+		return kagent.Session{}, f.createRefusal
+	}
 	if len(f.createErr) > 0 {
 		err := f.createErr[0]
 		f.createErr = f.createErr[1:]
@@ -141,6 +160,9 @@ func (f *fakeRemote) CreateSession(_ context.Context, userID, requestID string) 
 	s, ok := f.sessions[requestID]
 	if !ok {
 		s = kagent.Session{ID: uuid.NewString(), Revision: f.revision}
+		if f.v0 {
+			s.ID = requestID
+		}
 		f.sessions[requestID], f.owners[s.ID] = s, userID
 	}
 	if f.unpinned {
