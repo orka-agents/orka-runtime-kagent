@@ -2,6 +2,8 @@ module github.com/orka-agents/orka-runtime-kagent
 
 go 1.27.0
 
+toolchain go1.27.2
+
 require (
 	github.com/a2aproject/a2a-go/v2 v2.6.0
 	github.com/kagent-dev/kagent/go v0.0.0-20261015233236-1eb89fb1b670
