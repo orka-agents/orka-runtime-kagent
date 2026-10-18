@@ -104,12 +104,7 @@ func Run(args []string, getenv func(string) string) error {
 	go func() { _ = b.admit(ctx) }()
 	errs := make(chan error, 2)
 	if relayListener != nil {
-		relay := &http.Server{
-			Handler: b.relayHandler(),
-			// Tool calls may wait for an Orka approval, so there is no write deadline.
-			ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second,
-			MaxHeaderBytes: 32 << 10,
-		}
+		relay := newRelayServer(b.relayHandler())
 		go func() { errs <- relay.Serve(relayListener) }()
 		defer func() {
 			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -152,6 +147,21 @@ func newRemote(cfg config.Kagent, getenv func(string) string) (closableRemote, e
 		return nil, err
 	}
 	return kagent.NewV0(cfg, pin)
+}
+
+// newRelayServer serves the relay. Every response closes its connection:
+// kagent reaches the relay through a Service that moves to a new runtime on
+// a re-pin, and a kept-alive connection would keep reaching the old broker,
+// which knows none of the new runtime's turn tokens.
+func newRelayServer(handler http.Handler) *http.Server {
+	relay := &http.Server{
+		Handler: handler,
+		// Tool calls may wait for an Orka approval, so there is no write deadline.
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second,
+		MaxHeaderBytes: 32 << 10,
+	}
+	relay.SetKeepAlivesEnabled(false)
+	return relay
 }
 
 func loopbackAddr(value string) (string, error) {

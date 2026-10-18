@@ -133,6 +133,10 @@ kagent to call:
   model call, so use an `https` `upstreamBaseURL` unless the network path to
   it is trusted.
 
+The relay closes every connection after its response. kagent reaches it
+through a Service that moves to the new runtime on a re-pin, and a kept-alive
+connection would keep reaching the old broker.
+
 ### Turn tokens
 
 For each turn the broker mints a random token and sends it as the A2A

@@ -3,6 +3,7 @@ package broker
 import (
 	"errors"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -41,5 +42,26 @@ func TestRunFailsWhenTheRelayCannotBind(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run kept serving although the relay address was taken")
+	}
+}
+
+// The relay closes every connection, so a client whose Service moved to a new
+// runtime reaches it on its next request.
+func TestRelayClosesEveryConnection(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := newRelayServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusUnauthorized) }))
+	go func() { _ = relay.Serve(listener) }()
+	t.Cleanup(func() { _ = relay.Close() })
+	response, err := http.Get("http://" + listener.Addr().String() + "/mcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	// The client reads the server's Connection: close into Close.
+	if !response.Close {
+		t.Fatal("the relay kept its connection open")
 	}
 }
