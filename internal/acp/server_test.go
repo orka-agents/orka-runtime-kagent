@@ -63,7 +63,8 @@ func newPeerWithConfig(t *testing.T, provider http.HandlerFunc, mcpURL, agentCon
 		_ = input.Close()
 		_ = output.Close()
 		select {
-		case <-p.done:
+		case err := <-p.done:
+			_ = err // the transport close ends the child either way
 		case <-time.After(5 * time.Second):
 			t.Error("ACP child did not exit after transport close")
 		}

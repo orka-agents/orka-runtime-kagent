@@ -655,8 +655,8 @@ func TestAmbiguousSendSettlesOnlyWithKagentEvidence(t *testing.T) {
 			}
 			var messageID string
 			for _, call := range remote.snapshotCalls() {
-				if strings.HasPrefix(call, "stream ") {
-					messageID = strings.TrimPrefix(call, "stream ")
+				if id, ok := strings.CutPrefix(call, "stream "); ok {
+					messageID = id
 				}
 			}
 			if test.found {
