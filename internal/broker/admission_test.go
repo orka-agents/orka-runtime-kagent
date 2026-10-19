@@ -12,6 +12,7 @@ import (
 	"time"
 
 	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
+	apia2a "github.com/kagent-dev/kagent/go/api/a2a"
 
 	"github.com/orka-agents/orka-runtime-kagent/internal/kagent"
 )
@@ -174,6 +175,37 @@ func TestObservedTurnReportsKagentUsage(t *testing.T) {
 	usage, _ := events[len(events)-1].data["response"].(map[string]any)["usage"].(map[string]any)
 	if usage["input_tokens"] != float64(31) || usage["output_tokens"] != float64(10) {
 		data, _ := json.Marshal(usage)
+		t.Fatalf("reported usage = %s", data)
+	}
+}
+
+// kagent v1 reports each model call's usage on the artifact the call
+// produced. Updates and the terminal task repeat an artifact, so each one
+// counts once, including one only the terminal task carries.
+func TestObservedTurnReportsKagentV1ArtifactUsage(t *testing.T) {
+	remote := newFakeRemote()
+	usage := func(prompt, candidates float64) map[string]any {
+		return map[string]any{"kagent.dev/a2a/usage": map[string]any{"promptTokenCount": prompt, "candidatesTokenCount": candidates}}
+	}
+	remote.streams = append(remote.streams, func(_ context.Context, contextID, messageID string) []item {
+		call := &a2atype.Artifact{ID: "call", Metadata: usage(11, 7), Parts: []*a2atype.Part{apia2a.NewToolCallPart("call-1", "probe", map[string]any{})}}
+		answer := &a2atype.Artifact{ID: "answer", Metadata: usage(20, 3), Parts: []*a2atype.Part{a2atype.NewTextPart("ok")}}
+		remote.setTask(&a2atype.Task{ID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateCompleted},
+			Artifacts: []*a2atype.Artifact{call, answer}}, messageID)
+		update := func(artifact *a2atype.Artifact) item {
+			return item{event: &a2atype.TaskArtifactUpdateEvent{TaskID: "task-1", ContextID: contextID, Artifact: artifact}}
+		}
+		return []item{
+			{event: &a2atype.Task{ID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking}}},
+			update(call), update(call),
+		}
+	})
+	h := newHarness(t, remote)
+	recorder := h.turn(testOwner(1), h.prompt("prompt-1"))
+	events := parseSSE(t, recorder.Body.String())
+	reported, _ := events[len(events)-1].data["response"].(map[string]any)["usage"].(map[string]any)
+	if reported["input_tokens"] != float64(31) || reported["output_tokens"] != float64(10) {
+		data, _ := json.Marshal(reported)
 		t.Fatalf("reported usage = %s", data)
 	}
 }

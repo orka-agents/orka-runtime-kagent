@@ -43,20 +43,51 @@ func EventUsage(event a2atype.Event) (Usage, bool) {
 		if !ok {
 			raw, ok = m[v0UsageMetadataKey].(map[string]any)
 		}
+		if ok {
+			return parseUsage(raw)
+		}
+	}
+	return Usage{}, false
+}
+
+// ArtifactUsage returns the usage kagent v1 reports on the artifacts of
+// event, keyed by artifact ID: v1 records each model call's usage on the
+// artifact the call produced, which artifact updates and task snapshots may
+// both repeat, so a caller counts each key once.
+func ArtifactUsage(event a2atype.Event) map[a2atype.ArtifactID]Usage {
+	var artifacts []*a2atype.Artifact
+	switch e := event.(type) {
+	case *a2atype.TaskArtifactUpdateEvent:
+		artifacts = append(artifacts, e.Artifact)
+	case *a2atype.Task:
+		artifacts = e.Artifacts
+	}
+	usage := map[a2atype.ArtifactID]Usage{}
+	for _, artifact := range artifacts {
+		if artifact == nil || artifact.ID == "" {
+			continue
+		}
+		raw, ok := artifact.Metadata[apia2a.UsageMetadataKey].(map[string]any)
 		if !ok {
 			continue
 		}
-		prompt, okPrompt := count(raw["promptTokenCount"])
-		candidates, okCandidates := count(raw["candidatesTokenCount"])
-		if !okPrompt && !okCandidates {
-			return Usage{}, false
+		if parsed, ok := parseUsage(raw); ok {
+			usage[artifact.ID] = parsed
 		}
-		toolPrompt, _ := count(raw["toolUsePromptTokenCount"])
-		thoughts, _ := count(raw["thoughtsTokenCount"])
-		cached, hasCached := count(raw["cachedContentTokenCount"])
-		return Usage{Input: prompt + toolPrompt, Output: candidates + thoughts, Cached: cached, HasCached: hasCached}, true
 	}
-	return Usage{}, false
+	return usage
+}
+
+func parseUsage(raw map[string]any) (Usage, bool) {
+	prompt, okPrompt := count(raw["promptTokenCount"])
+	candidates, okCandidates := count(raw["candidatesTokenCount"])
+	if !okPrompt && !okCandidates {
+		return Usage{}, false
+	}
+	toolPrompt, _ := count(raw["toolUsePromptTokenCount"])
+	thoughts, _ := count(raw["thoughtsTokenCount"])
+	cached, hasCached := count(raw["cachedContentTokenCount"])
+	return Usage{Input: prompt + toolPrompt, Output: candidates + thoughts, Cached: cached, HasCached: hasCached}, true
 }
 
 // count reads a non-negative integral JSON number.

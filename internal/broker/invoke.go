@@ -194,6 +194,8 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 	var taskID a2atype.TaskID
 	var state a2atype.TaskState
 	var sendPods []string
+	// kagent v1 reports usage on artifacts, which several events may repeat.
+	countedArtifacts := map[a2atype.ArtifactID]bool{}
 	streamCtx, stopStream := context.WithCancel(b.ctx)
 	defer stopStream()
 	stopGrace := context.AfterFunc(ctx, func() { time.AfterFunc(b.cfg.cancelGrace, stopStream) })
@@ -237,6 +239,12 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 			}
 			if usage, ok := kagent.EventUsage(event); ok {
 				out.kagentUsage.add(usage.Input, usage.Output, usage.Cached, usage.HasCached)
+			}
+			for id, usage := range kagent.ArtifactUsage(event) {
+				if !countedArtifacts[id] {
+					countedArtifacts[id] = true
+					out.kagentUsage.add(usage.Input, usage.Output, usage.Cached, usage.HasCached)
+				}
 			}
 			if id := event.TaskInfo().TaskID; !bound || (id != "" && taskID == "") {
 				bound, taskID = true, cmp.Or(taskID, id)
@@ -301,6 +309,13 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 	if err != nil {
 		out.failure = failUnknown
 		return out
+	}
+	// The terminal task may hold artifacts the stream did not carry.
+	for id, usage := range kagent.ArtifactUsage(task) {
+		if !countedArtifacts[id] {
+			countedArtifacts[id] = true
+			out.kagentUsage.add(usage.Input, usage.Output, usage.Cached, usage.HasCached)
+		}
 	}
 	out.invocation.State, out.invocation.Terminal = invocationCompleted, string(task.Status.State)
 	if task.Status.State != a2atype.TaskStateCompleted {

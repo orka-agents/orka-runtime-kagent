@@ -68,8 +68,9 @@ One image provides both processes:
   wrapped agent cannot answer kagent approval prompts.
 - **Token usage.** A governed turn reports the usage the relay metered. An
   observed turn's model calls bypass Orka, so it reports the usage kagent put
-  on the turn's events, summed once per model call. kagent measured those
-  numbers, not Orka.
+  on the turn, summed once per model call: kagent v0 puts it on the turn's
+  events, and kagent v1 on the artifact each model call produced. kagent
+  measured those numbers, not Orka.
 
 ## Admission checks
 
