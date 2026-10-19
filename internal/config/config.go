@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	// AgentConfigPath is the configuration baked into the configured image.
+	// AgentConfigPath is where each runtime mounts its Agent's configuration.
 	AgentConfigPath = "/agent/kagent.json"
 	// ModelEnv and ConfigDigestEnv are set by the Orka supervisor for the
 	// child, and by the deployment for the broker sidecar.
