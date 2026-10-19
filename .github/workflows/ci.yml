@@ -67,7 +67,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: orka-agents/orka-runtime-foundry
-          # The commit the copies in NOTICE were last synced from.
+          # The commit the copied packages were last synced from.
           ref: 815fb76c3381d2537995461c08d3f0fe6ba97464
           path: .foundry
           persist-credentials: false

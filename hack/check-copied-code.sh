@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Checks that the packages copied from orka-runtime-foundry (see NOTICE) still
-# match their source, apart from the module path. Test files may differ.
+# Checks that internal/strictjson and internal/durablestore, copied from
+# orka-runtime-foundry, still match their source, apart from the module path.
+# Test files may differ.
 #
 # usage: hack/check-copied-code.sh <orka-runtime-foundry checkout>
 set -euo pipefail
