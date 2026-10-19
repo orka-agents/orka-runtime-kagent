@@ -283,7 +283,11 @@ func (c *V0Client) Stream(ctx context.Context, userID, contextID, messageID, tex
 				return
 			}
 		}
-		verify(nil, nil)
+		// A stream that ended without an event still reached the pinned pod
+		// once the check passes, and says so.
+		if !verified && verify(nil, nil) {
+			yield(nil, errors.Join(ErrPinHeld, io.ErrUnexpectedEOF))
+		}
 	}
 }
 

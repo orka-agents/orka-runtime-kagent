@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -629,5 +630,30 @@ func TestV0StreamChecksThePodWhenTheSendFailsEarly(t *testing.T) {
 	var lost *PinLostError
 	if _, err := streamEvents(client, ""); !errors.As(err, &lost) || lost.TaskID != "" || errors.Is(err, ErrPinHeld) {
 		t.Fatalf("an early failure across a pod change = %v, want a PinLostError without a task", err)
+	}
+}
+
+// emptyPod accepts the send and ends its event stream without an event.
+type emptyPod struct{ *fakeV0Pod }
+
+func (f emptyPod) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	f.fakeV0Pod.ServeHTTP(w, r)
+}
+
+// A stream that ends without an event on the pinned pod reports the confirmed
+// pin, so the broker can settle the send as bound.
+func TestV0EmptyStreamOnThePinnedPodIsConfirmed(t *testing.T) {
+	client, _, _ := newV0PodTest(t)
+	server := httptest.NewServer(emptyPod{&fakeV0Pod{}})
+	t.Cleanup(server.Close)
+	client.pin = &swappingPin{address: server.Listener.Addr().String()}
+	events, err := streamEvents(client, "")
+	if len(events) != 0 || !errors.Is(err, ErrPinHeld) || !errors.Is(err, io.ErrUnexpectedEOF) || NotAccepted(err) {
+		t.Fatalf("an empty stream = %d events, %v", len(events), err)
 	}
 }
