@@ -1,11 +1,12 @@
 # Configuration
 
-`orka agent import kagent` and Orka's `scripts/kagent-runtime.sh` write this
+`orka agent import kagent` and `orka agent-runtime kagent deploy` write this
 configuration for you. This page is a reference for reading or debugging a
 deployed runtime.
 
-`/agent/kagent.json` is baked into the configured image. Both processes check
-its SHA-256 against `ORKA_KAGENT_ACP_AGENT_CONFIGURATION_DIGEST`.
+Each runtime mounts its Agent's `/agent/kagent.json` from a ConfigMap. Both
+processes check its SHA-256 against
+`ORKA_KAGENT_ACP_AGENT_CONFIGURATION_DIGEST`.
 
 ```json
 {
@@ -33,7 +34,7 @@ its SHA-256 against `ORKA_KAGENT_ACP_AGENT_CONFIGURATION_DIGEST`.
 
 | Process | Variable | Purpose |
 | --- | --- | --- |
-| both | `ORKA_KAGENT_ACP_MODEL`, `ORKA_KAGENT_ACP_AGENT_CONFIGURATION_DIGEST` | Must match the baked config |
+| both | `ORKA_KAGENT_ACP_MODEL`, `ORKA_KAGENT_ACP_AGENT_CONFIGURATION_DIGEST` | Must match the mounted configuration |
 | child | `ORKA_KAGENT_ACP_PROVIDER_BASE_URL`, `ORKA_KAGENT_ACP_PROVIDER_TOKEN` | Set by the supervisor (loopback proxy) |
 | broker | `ORKA_KAGENT_BROKER_ADDR` | Loopback listen address, default `127.0.0.1:8091` |
 | broker | `ORKA_KAGENT_BROKER_STATE_DIR` | Absolute path on a broker-only persistent volume |

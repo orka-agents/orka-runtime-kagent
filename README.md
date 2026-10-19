@@ -38,7 +38,7 @@ Most of what you have stays as it is:
   session, and the adapter deletes that session when Orka is done with it.
 - **The Agent is pinned.** The adapter runs exactly the Agent it was set up
   for. After you edit the Agent or its ModelConfig, or upgrade kagent, you
-  re-pin it with a short scripted step. Until then its turns fail with
+  re-pin it with three `orka` commands. Until then its turns fail with
   `kagent_revision_mismatch`.
 - **Approvals move to Orka.** kagent's own approval prompts
   (`requireApproval`) can't be answered through the adapter, so Agents that
@@ -82,19 +82,21 @@ with `--accept-kagent-commit` when you import.
 
 ## Getting started
 
-You need:
+You need a Kubernetes cluster with a supported kagent and Orka installed, and
+the `orka` CLI with access to the cluster. Nothing is built or checked out:
+each runtime runs Orka's kagent runtime image, released with your CLI.
 
-- a Kubernetes cluster with a supported kagent and Orka installed;
-- `kubectl` and the `orka` CLI;
-- a checkout of [Orka](https://github.com/orka-agents/orka), for
-  `scripts/kagent-runtime.sh`, and a checkout of this repository, which the
-  script builds the adapter image from;
-- a container registry your cluster can pull from.
-
-The steps:
-
-1. **Prepare your kagent install.** Apply the NetworkPolicies for your kagent
-   version: [Prepare your kagent install](docs/kagent-install.md).
+1. **Lock down your kagent install.** kagent ships without NetworkPolicies, so
+   apply the ones for your version; the YAML is in
+   [Prepare your kagent install](docs/kagent-install.md).
+   - **kagent v0:** let only kagent's controller and the adapter reach Agent
+     pods, only Agent pods and the adapter reach the controller, and only the
+     controller reach kagent's database. Run Agents on the Go runtime with one
+     replica, and turn off kagent's UI.
+   - **kagent v1:** let only kagent's controller reach Substrate's actor
+     router, and only the adapter reach kagent's API. Point
+     `runtimeDefaults.controlPlaneUrl` at a proxy that forwards only kagent's
+     five TaskStore methods.
 
 2. **Preview the import.** Export your kagent Agents and the objects they
    use, then run a dry run. It reports each Agent as observed or governed,
@@ -106,21 +108,19 @@ The steps:
      --unreachable kagent-postgresql.kagent.svc:5432
    ```
 
-3. **Deploy the runtime.** This builds the adapter image, deploys it, and
-   waits until Orka reports it Ready. A governed Agent also needs
-   `MODEL_UPSTREAM_TOKEN_FILE`, a file holding Orka's credential for its model
-   endpoint:
+3. **Deploy the runtime.** This deploys it and waits until Orka reports it
+   Ready. A governed Agent also needs `--model-upstream-token-file`, a file
+   holding Orka's credential for its model endpoint:
 
    ```bash
-   KUBECTL_CONTEXT=<context> WRAPPER_SRC=<this checkout> IMAGE_REPO=<registry> \
-     scripts/kagent-runtime.sh deploy bundle/<agent>
+   orka agent-runtime kagent deploy bundle/<agent> -n orka-system
    ```
 
 4. **Activate it.** Point the Orka Agent at the new runtime, using the import
    flags from step 2 without `--dry-run`:
 
    ```bash
-   KUBECTL_CONTEXT=<context> scripts/kagent-runtime.sh activate bundle/<agent> -- \
+   orka agent-runtime kagent activate bundle/<agent> -n orka-system -- \
      -f export.yaml <the other import flags>
    ```
 
@@ -143,10 +143,15 @@ walks through every flag, including the governed-mode flags `--relay-url`,
 
 ## Changing an Agent later
 
-Edited the Agent, its ModelConfig, or kagent itself? Re-pin it with the same
-steps: write a new bundle, `deploy`, `activate`, then `retire` the old
-runtime. Old and new runtimes run side by side until you switch, and `retire`
-waits for the old one's sessions to finish. The
+Edited the Agent, its ModelConfig, or kagent itself? Re-pin it: write a new
+bundle, `deploy` and `activate` it, then retire the old runtime:
+
+```bash
+orka agent-runtime kagent retire bundle/<agent> -n orka-system
+```
+
+Old and new runtimes run side by side until you switch, and `retire` waits
+for the old one's sessions to finish. The
 [Orka kagent guide](https://orka-agents.github.io/orka/docs/guides/kagent#deploy-and-re-pin)
 has the details.
 

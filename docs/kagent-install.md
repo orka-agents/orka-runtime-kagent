@@ -6,6 +6,12 @@ so apply the ones for your kagent version before you wrap an Agent. The
 adapter checks part of this before every turn; see
 [Admission checks](how-it-works.md#admission-checks).
 
+`orka agent-runtime kagent deploy` creates each runtime's own objects: its
+pod, labeled `orka.ai/kagent-broker: "true"` for the policies below, a
+governed Agent's relay and the NetworkPolicy in front of it, and, for kagent
+v0, the broker's read access to the Agent's pods. This page covers what you
+set up once per kagent install.
+
 ## kagent v1
 
 ### Install settings
@@ -77,7 +83,8 @@ digest then keeps it fixed.
 - The revision's egress list names only the relay and the control-plane
   filter. kagent also always allows its provider's default host, which is an
   accepted risk.
-- A NetworkPolicy lets only the kagent Agent pods reach the relay.
+- Only the kagent Agent's traffic reaches the relay. Deploy creates that
+  NetworkPolicy.
 
 On the Orka side, render the profile with the Orka tools the Agent may call
 (`--allowed-tool`, `--approval-required-tool`).
@@ -149,8 +156,9 @@ the import checks the image's name, and the pin keeps that exact image.
         ports: [{port: 5432, protocol: TCP}]
   ```
 
-  Label each wrapper pod `orka.ai/kagent-broker: "true"`. Turn off kagent's
-  UI or keep it off this network: it calls the controller as any user.
+  Deploy labels each runtime pod `orka.ai/kagent-broker: "true"`. Turn off
+  kagent's UI or keep it off this network: it calls the controller as any
+  user.
 
   These policies trust any pod in the Orka namespace that carries that
   label, so only operators may create or label pods there, as for every
@@ -166,21 +174,9 @@ the import checks the image's name, and the pin keeps that exact image.
   refuses such Agents in either mode. Add nothing else to Agent pods that
   could reach the controller.
 - **Broker access to the Agent's pods.** The broker lists the Agent's pods
-  with its pod's service account. Grant `get` and `list` on `pods` in the
-  Agent's namespace, and mount a token into the broker container only:
-
-  ```yaml
-  # In the wrapper pod spec; automountServiceAccountToken stays false.
-  volumes:
-    - name: broker-kube
-      projected:
-        sources:
-          - serviceAccountToken: {path: token, expirationSeconds: 3600}
-          - configMap: {name: kube-root-ca.crt, items: [{key: ca.crt, path: ca.crt}]}
-  # In the broker container:
-  volumeMounts:
-    - {name: broker-kube, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true}
-  ```
+  with its pod's service account. Deploy grants it `get` and `list` on
+  `pods` in the Agent's namespace, and mounts the token into the broker
+  container only.
 - **Governed v0 Agents** (the import checks these):
   - the model is an OpenAI `ModelConfig` with `openAI.baseUrl` set to the
     relay's `/v1`, `apiKeyPassthrough: true`, and the chat completions format;
