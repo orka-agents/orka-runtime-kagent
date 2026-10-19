@@ -352,11 +352,14 @@ where this section says otherwise.
   is refused. The send then reuses that connection and never opens another.
   A pod keeps its address for its whole life, so once the send may have
   arrived, finding the same pod still at that address proves the turn runs
-  there. If the pod changed in
-  between, the turn fails with `kagent_revision_mismatch` and settles only as
-  an [ambiguous send](#how-v0-differs): which pod runs it is unknown, so a
-  cancel answered by the current pod proves nothing. That Orka session cannot
-  continue. A send that never reached the pod is retried.
+  there. The ledger records each send as unbound before it is made, and
+  clears that only once this check passes. If the pod changed in between, or
+  the broker stopped first, the send settles only as an
+  [ambiguous send](#how-v0-differs) that waits for the pods to be replaced:
+  which pod runs it is unknown, so a cancel answered by the current pod
+  proves nothing, and a governed turn's revoked token proves nothing either.
+  A pod change fails the turn with `kagent_revision_mismatch`, and that Orka
+  session cannot continue. A send that never reached the pod is retried.
 - **One replica.** A cancel reaches only the pod that runs the task, so a
   wrapped v0 Agent must run a single replica.
 - **Settlement.** Deleting a v0 session only marks its row; a running turn

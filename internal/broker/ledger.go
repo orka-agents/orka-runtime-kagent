@@ -128,10 +128,13 @@ type invocation struct {
 	FencedAt   time.Time `json:"fencedAt,omitzero"`
 	FencedPods []string  `json:"fencedPods,omitempty"`
 	Terminal   string    `json:"terminal,omitempty"`
-	// Unbound records that kagent v0's pinned pod was replaced while the send
-	// was in flight, so which pod runs the task is unknown. Its task's state,
-	// and a cancel answered by whichever pod is current, prove nothing: it
-	// settles only as a fenced send.
+	// Unbound records that a kagent v0 send may have reached a pod other
+	// than the pinned one: it is set before each send and cleared once the
+	// client confirms the pinned pod served it, so it stays set when the
+	// pinned pod was replaced during the send, or the broker stopped first.
+	// Which pod runs the task is then unknown. Its task's state, and a cancel
+	// answered by whichever pod is current, prove nothing: it settles only as
+	// a fenced send.
 	Unbound bool `json:"unbound,omitempty"`
 }
 
@@ -314,7 +317,7 @@ func promptValid(p *prompt, key, digest string, s *session) bool {
 func invocationValid(inv *invocation, sequence uint64, p *prompt, s *session) bool {
 	if inv == nil || inv.Sequence != sequence || sequence == 0 || !config.DigestValid(inv.BodyDigest) ||
 		!config.SafeString(inv.OperationID, 512) || s.Operations[inv.OperationID] == "" ||
-		(!inv.FencedAt.IsZero() && inv.State != invocationIntent && inv.State != invocationSettled) ||
+		(!inv.FencedAt.IsZero() && inv.State != invocationIntent && inv.State != invocationSettled && !inv.Unbound) ||
 		(inv.FencedAt.IsZero() && len(inv.FencedPods) != 0) || len(inv.FencedPods) > maxFencedPods {
 		return false
 	}

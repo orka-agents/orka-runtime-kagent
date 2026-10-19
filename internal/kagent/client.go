@@ -46,6 +46,9 @@ var (
 	ErrAmbiguous = errors.New("kagent task lookup is ambiguous")
 	// ErrNotSent reports that a send failed before anything reached kagent.
 	ErrNotSent = errors.New("kagent send was not made")
+	// ErrPinHeld marks a send error kagent v0's client yields only after
+	// confirming that the pinned pod served the send's connection.
+	ErrPinHeld = errors.New("kagent Agent pod held through the send")
 )
 
 // Session is the subset of a kagent Session the broker relies on.

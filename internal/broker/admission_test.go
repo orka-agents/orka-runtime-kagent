@@ -143,6 +143,11 @@ func TestLostPinFencesTheTurn(t *testing.T) {
 		t.Fatal("settled while the fenced pods remain")
 	}
 	eventually(t, "fence", func() bool { return remote.count("delete ") == 1 })
+	// The fence survives a restart.
+	h.restart()
+	if _, response := h.controlOnce(settlePath, o, p); response.SettlementProven {
+		t.Fatal("settled after a restart while the fenced pods remain")
+	}
 	remote.setPods("pod-b")
 	if !h.control(settlePath, o, p).SettlementProven || remote.count("cancel ") != 0 {
 		t.Fatalf("the fenced send did not settle without a cancel: %v", remote.snapshotCalls())
@@ -317,11 +322,73 @@ func TestLostPinBeforeATaskFencesTheTurn(t *testing.T) {
 		t.Fatal("settled before the fence")
 	}
 	eventually(t, "fence", func() bool { return remote.count("delete ") == 1 })
+	// The send stays a taskless intent, which survives a restart.
+	h.restart()
 	if _, response := h.controlOnce(settlePath, o, p); response.SettlementProven {
 		t.Fatal("settled while the fenced pods remain")
 	}
 	remote.setPods("pod-b")
 	if !h.control(settlePath, o, p).SettlementProven {
 		t.Fatalf("the fenced send did not settle: %v", remote.snapshotCalls())
+	}
+}
+
+// A kagent v0 send is unbound from before it is dispatched until its client
+// confirms the pinned pod. A broker that stops in between cannot know which
+// pod received it, so the revoked turn token does not settle it.
+func TestStopBeforeThePinIsConfirmedFencesTheSend(t *testing.T) {
+	remote := newFakeRemote()
+	remote.v0 = true
+	remote.setPods("pod-a")
+	started := make(chan struct{})
+	remote.streams = append(remote.streams, func(ctx context.Context, _, _ string) []item {
+		close(started)
+		<-ctx.Done()
+		return nil
+	})
+	g := newGovernedHarness(t, remote)
+	g.kagentV0 = true
+	g.restart()
+	o, p := testOwner(1), g.prompt("prompt-1")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.governedTurn(o, p)
+	}()
+	<-started
+	g.b.close()
+	<-done
+	g.open()
+	if _, response := g.controlOnce(settlePath, o, p); response.SettlementProven {
+		t.Fatal("settled on the revoked turn token alone")
+	}
+	eventually(t, "fence", func() bool { return remote.count("delete ") == 1 })
+	if _, response := g.controlOnce(settlePath, o, p); response.SettlementProven {
+		t.Fatal("settled while the fenced pods remain")
+	}
+	remote.setPods("pod-b")
+	if !g.control(settlePath, o, p).SettlementProven {
+		t.Fatalf("the fenced send did not settle: %v", remote.snapshotCalls())
+	}
+}
+
+// A send error the client confirmed on the pinned pod keeps the governed
+// proof: the turn's revoked token settles it once its task cannot appear.
+func TestConfirmedSendErrorSettlesOnTheRevokedToken(t *testing.T) {
+	remote := newFakeRemote()
+	remote.v0 = true
+	remote.setPods("pod-a")
+	remote.streams = append(remote.streams, func(context.Context, string, string) []item {
+		return []item{{err: errors.New("connection reset")}}
+	})
+	g := newGovernedHarness(t, remote)
+	g.kagentV0 = true
+	g.restart()
+	o, p := testOwner(1), g.prompt("prompt-1")
+	g.governedTurn(o, p)
+	g.advance(dispatchFenceWindow + time.Second)
+	// pod-a still runs: the proof needs no replacement.
+	if !g.control(settlePath, o, p).SettlementProven {
+		t.Fatalf("the confirmed send did not settle: %v", remote.snapshotCalls())
 	}
 }

@@ -210,6 +210,12 @@ func (f *fakeRemote) Stream(ctx context.Context, _, contextID, messageID, _, aut
 			return
 		}
 		for _, it := range script(ctx, contextID, messageID) {
+			// kagent v0's client marks an error it yields after confirming
+			// the pinned pod.
+			var lost *kagent.PinLostError
+			if f.v0 && it.err != nil && !errors.Is(it.err, kagent.ErrNotSent) && !errors.As(it.err, &lost) {
+				it.err = errors.Join(kagent.ErrPinHeld, it.err)
+			}
 			if !yield(it.event, it.err) {
 				return
 			}

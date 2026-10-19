@@ -273,7 +273,13 @@ func (c *V0Client) Stream(ctx context.Context, userID, contextID, messageID, tex
 			return true
 		}
 		for event, err := range client.SendStreamingMessage(ctx, &a2atype.SendMessageRequest{Message: message}) {
-			if !verify(event, err) || !yield(event, err) || err != nil {
+			if !verify(event, err) {
+				return
+			}
+			if err != nil && !errors.Is(err, ErrNotSent) {
+				err = errors.Join(ErrPinHeld, err)
+			}
+			if !yield(event, err) || err != nil {
 				return
 			}
 		}

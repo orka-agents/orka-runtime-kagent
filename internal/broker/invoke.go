@@ -209,7 +209,9 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 			out.failure = failUnknown
 			return out
 		}
-		notAccepted, pinLost := false, false
+		// kagent v0's client confirms the pinned pod served the send before it
+		// yields the first event, and marks an error it confirmed.
+		notAccepted, pinLost, bound := false, false, !b.cfg.kagentV0
 		for event, err := range b.remote.Stream(streamCtx, s.UserID, s.RemoteID, messageID, text, authorization) {
 			if err != nil {
 				notAccepted = taskID == "" && kagent.NotAccepted(err)
@@ -220,15 +222,17 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 					// task as evidence.
 					taskID = cmp.Or(taskID, lost.TaskID)
 					b.markUnbound(key, promptKey, sequence, string(taskID))
+				} else if !bound && errors.Is(err, kagent.ErrPinHeld) {
+					b.markSent(key, promptKey, sequence, "")
 				}
 				break
 			}
 			if usage, ok := kagent.EventUsage(event); ok {
 				out.kagentUsage.add(usage.Input, usage.Output, usage.Cached, usage.HasCached)
 			}
-			if id := event.TaskInfo().TaskID; id != "" && taskID == "" {
-				taskID = id
-				b.markAccepted(key, promptKey, sequence, string(id))
+			if id := event.TaskInfo().TaskID; !bound || (id != "" && taskID == "") {
+				bound, taskID = true, cmp.Or(taskID, id)
+				b.markSent(key, promptKey, sequence, string(id))
 			}
 			switch e := event.(type) {
 			case *a2atype.TaskArtifactUpdateEvent:
@@ -558,6 +562,7 @@ func (b *lifecycleBroker) markIntent(key, promptKey string, sequence uint64, mes
 }
 
 // stampAttempt records the start of a send attempt as the dispatch fence base.
+// A kagent v0 send is unbound until its client confirms the pinned pod.
 func (b *lifecycleBroker) stampAttempt(key, promptKey string, sequence uint64) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -567,20 +572,25 @@ func (b *lifecycleBroker) stampAttempt(key, promptKey string, sequence uint64) e
 		if inv == nil || inv.State != invocationIntent {
 			return errPending
 		}
-		inv.SentAt = now
+		inv.SentAt, inv.Unbound = now, b.cfg.kagentV0
 		return nil
 	})
 }
 
-func (b *lifecycleBroker) markAccepted(key, promptKey string, sequence uint64, taskID string) {
+// markSent records that the send reached kagent's pinned pod, and the task
+// once kagent names it.
+func (b *lifecycleBroker) markSent(key, promptKey string, sequence uint64, taskID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	_ = b.commitLocked(false, func(next *ledger) error {
 		inv := invocationFor(next, key, promptKey, sequence)
-		if inv == nil || inv.State != invocationIntent {
+		if inv == nil || (inv.State != invocationIntent && inv.State != invocationAccepted) {
 			return nil
 		}
-		inv.State, inv.TaskID = invocationAccepted, taskID
+		inv.Unbound = false
+		if inv.State == invocationIntent && taskID != "" {
+			inv.State, inv.TaskID = invocationAccepted, taskID
+		}
 		return nil
 	})
 }
@@ -619,7 +629,7 @@ func (b *lifecycleBroker) markUnbound(key, promptKey string, sequence uint64, ta
 	defer b.mu.Unlock()
 	_ = b.commitLocked(false, func(next *ledger) error {
 		if inv := invocationFor(next, key, promptKey, sequence); inv != nil {
-			if inv.State == invocationIntent {
+			if inv.State == invocationIntent && taskID != "" {
 				inv.State, inv.TaskID = invocationAccepted, taskID
 			}
 			inv.Unbound = true

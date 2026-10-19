@@ -469,7 +469,7 @@ func TestV0StreamRefusesBeforeSendingWithoutAPinnedPod(t *testing.T) {
 			client, _, pod := newV0PodTest(t)
 			pin.address = client.pin.(fixedPin).address
 			client.pin = pin
-			if _, err := streamEvents(client, ""); !errors.Is(err, ErrNotSent) || !NotAccepted(err) {
+			if _, err := streamEvents(client, ""); !errors.Is(err, ErrNotSent) || !NotAccepted(err) || errors.Is(err, ErrPinHeld) {
 				t.Fatalf("Stream = %v, want ErrNotSent", err)
 			}
 			if calls := pod.calls(); len(calls) != 0 {
@@ -579,7 +579,7 @@ func TestV0StreamIsBoundToAConnectionServingTheAgentsCard(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			client, _, pod := newV0PodTest(t)
 			set(pod)
-			if _, err := streamEvents(client, ""); !errors.Is(err, ErrNotSent) || !NotAccepted(err) {
+			if _, err := streamEvents(client, ""); !errors.Is(err, ErrNotSent) || !NotAccepted(err) || errors.Is(err, ErrPinHeld) {
 				t.Fatalf("Stream = %v, want ErrNotSent", err)
 			}
 			for _, call := range pod.calls() {
@@ -610,7 +610,7 @@ func (f failingPod) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // A send that fails before its first event may still have reached a pod, so
-// the pod is checked then too.
+// the pod is checked then too, and an error the check confirmed says so.
 func TestV0StreamChecksThePodWhenTheSendFailsEarly(t *testing.T) {
 	client, _, _ := newV0PodTest(t)
 	pod := &fakeV0Pod{}
@@ -618,8 +618,8 @@ func TestV0StreamChecksThePodWhenTheSendFailsEarly(t *testing.T) {
 	t.Cleanup(server.Close)
 	pin := &swappingPin{address: server.Listener.Addr().String()}
 	client.pin = pin
-	if _, err := streamEvents(client, ""); err == nil || errors.Is(err, ErrPinLost) || NotAccepted(err) {
-		t.Fatalf("an early failure on the pinned pod = %v, want an ordinary error", err)
+	if _, err := streamEvents(client, ""); !errors.Is(err, ErrPinHeld) || errors.Is(err, ErrPinLost) || NotAccepted(err) {
+		t.Fatalf("an early failure on the pinned pod = %v, want a confirmed ordinary error", err)
 	}
 	pod.beforeReply = func() {
 		pin.mu.Lock()
@@ -627,7 +627,7 @@ func TestV0StreamChecksThePodWhenTheSendFailsEarly(t *testing.T) {
 		pin.mu.Unlock()
 	}
 	var lost *PinLostError
-	if _, err := streamEvents(client, ""); !errors.As(err, &lost) || lost.TaskID != "" {
+	if _, err := streamEvents(client, ""); !errors.As(err, &lost) || lost.TaskID != "" || errors.Is(err, ErrPinHeld) {
 		t.Fatalf("an early failure across a pod change = %v, want a PinLostError without a task", err)
 	}
 }
