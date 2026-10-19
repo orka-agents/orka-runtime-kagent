@@ -57,11 +57,14 @@ type fakeRemote struct {
 	streams   []func(ctx context.Context, contextID, messageID string) []item
 	calls     []string
 	findErr   error
-	cancelErr error    // CancelTask fails with this, as a timed-out cancel would
-	pods      []string // UIDs of the pods running the Agent (kagent v0)
-	unpinned  bool     // sessions exist, but the Agent's config cannot be pinned (kagent v0)
-	onFind    func()   // runs during a task lookup
-	auth      string   // the authorization of the latest stream
+	cancelErr error             // CancelTask fails with this, as a timed-out cancel would
+	pods      []string          // UIDs of the pods running the Agent (kagent v0)
+	podErrs   []error           // AgentPodUIDs fails with these first, one per call
+	sent      map[string]string // message ID -> pod confirmed to serve it, while streaming (kagent v0)
+	onBind    func()            // runs once a v0 send's pod is confirmed, before its first item
+	unpinned  bool              // sessions exist, but the Agent's config cannot be pinned (kagent v0)
+	onFind    func()            // runs during a task lookup
+	auth      string            // the authorization of the latest stream
 	// v0 models kagent v0.x: a deleted session's tasks stay readable and
 	// cancellable by ID, because deletion does not stop the Agent, but they can
 	// no longer be listed by session. Sessions take the caller's ID.
@@ -93,7 +96,7 @@ func (f *fakeRemote) lastAuthorization() string {
 func newFakeRemote() *fakeRemote {
 	return &fakeRemote{revision: testRevision, sessions: map[string]kagent.Session{}, owners: map[string]string{},
 		deleted: map[string]bool{}, deleting: map[string]bool{}, stuck: map[a2atype.TaskID]bool{},
-		tasks: map[a2atype.TaskID]*a2atype.Task{}, messages: map[string]a2atype.TaskID{}}
+		tasks: map[a2atype.TaskID]*a2atype.Task{}, messages: map[string]a2atype.TaskID{}, sent: map[string]string{}}
 }
 
 // deleteAll deletes every session, as kagent's idle expiry or an operator would.
@@ -209,10 +212,28 @@ func (f *fakeRemote) Stream(ctx context.Context, _, contextID, messageID, _, aut
 			yield(nil, errors.New("no scripted stream"))
 			return
 		}
+		defer func() {
+			f.mu.Lock()
+			delete(f.sent, messageID)
+			f.mu.Unlock()
+		}()
+		bound := false
 		for _, it := range script(ctx, contextID, messageID) {
-			// kagent v0's client marks an error it yields after confirming
-			// the pinned pod.
+			// kagent v0's client confirms the pod that serves the send before
+			// it yields anything, and marks an error it yields after that.
 			var lost *kagent.PinLostError
+			if f.v0 && !bound && !errors.Is(it.err, kagent.ErrNotSent) && !errors.As(it.err, &lost) {
+				bound = true
+				f.mu.Lock()
+				if len(f.pods) > 0 {
+					f.sent[messageID] = f.pods[0]
+				}
+				onBind := f.onBind
+				f.mu.Unlock()
+				if onBind != nil {
+					onBind()
+				}
+			}
 			if f.v0 && it.err != nil && !errors.Is(it.err, kagent.ErrNotSent) && !errors.As(it.err, &lost) {
 				it.err = errors.Join(kagent.ErrPinHeld, it.err)
 			}
@@ -265,7 +286,19 @@ func (f *fakeRemote) FindTaskByMessage(_ context.Context, _, contextID, messageI
 func (f *fakeRemote) AgentPodUIDs(context.Context) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if len(f.podErrs) > 0 {
+		err := f.podErrs[0]
+		f.podErrs = f.podErrs[1:]
+		return nil, err
+	}
 	return append([]string(nil), f.pods...), nil
+}
+
+func (f *fakeRemote) SendPod(messageID string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	uid, ok := f.sent[messageID]
+	return uid, ok
 }
 
 func (f *fakeRemote) setPods(uids ...string) {

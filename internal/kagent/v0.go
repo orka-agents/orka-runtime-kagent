@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -67,6 +68,13 @@ var ErrRollout = errors.New("kagent Agent is not exactly one ready pod")
 // still be owned and deleted; nothing may be sent in it until a read pins it.
 var ErrUnpinned = errors.New("kagent session exists but its Agent config is not pinned")
 
+// errPinChanged reports that the Agent's only pod runs another config or image.
+var errPinChanged = errors.New("the Agent pod runs another config or image")
+
+// pinCheckRetry spaces the retries of a pod lookup that failed while a send
+// is checked: a failed lookup proves nothing about the pod.
+var pinCheckRetry = 250 * time.Millisecond
+
 // ErrPinLost reports that the pod a send was addressed to was no longer the
 // Agent's only pod once the send was accepted, so the turn may not have run
 // on the pinned config.
@@ -114,6 +122,9 @@ type V0Client struct {
 	hash     string
 	image    string
 	accepted []string
+	// sent maps the message ID of each open stream whose pod is confirmed to
+	// that pod's UID.
+	sent sync.Map
 }
 
 // NewV0 builds a client for the Agent named by cfg. pin reads the Agent's
@@ -229,6 +240,16 @@ func (c *V0Client) GetSession(ctx context.Context, userID, id string) (Session, 
 // its pod's process, so once a pod is gone so is everything it ran.
 func (c *V0Client) AgentPodUIDs(ctx context.Context) ([]string, error) { return c.pin.PodUIDs(ctx) }
 
+// SendPod returns the UID of the pod confirmed to serve the send of
+// messageID, while that send's stream is open.
+func (c *V0Client) SendPod(messageID string) (string, bool) {
+	uid, ok := c.sent.Load(messageID)
+	if !ok {
+		return "", false
+	}
+	return uid.(string), true
+}
+
 // Stream sends one user message to the Agent's pinned pod and yields its
 // events. The pod must be the Agent's only pod and run the pinned config and
 // image, and the connection must serve this Agent's card (see bindPod). A pod
@@ -250,6 +271,7 @@ func (c *V0Client) Stream(ctx context.Context, userID, contextID, messageID, tex
 			return
 		}
 		defer done()
+		defer c.sent.Delete(messageID)
 		message := a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart(text))
 		message.ID, message.ContextID = messageID, contextID
 		verified := false
@@ -260,6 +282,11 @@ func (c *V0Client) Stream(ctx context.Context, userID, contextID, messageID, tex
 			// A cancelled send is checked too, so the check outlives it.
 			checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.callTimeout)
 			again, perr := c.pinnedPod(checkCtx)
+			// Only a rollout, or a pod that differs, proves the pin lost; a
+			// lookup that failed is retried while the check has time.
+			for perr != nil && !errors.Is(perr, ErrRollout) && !errors.Is(perr, errPinChanged) && waitCtx(checkCtx, pinCheckRetry) {
+				again, perr = c.pinnedPod(checkCtx)
+			}
 			cancel()
 			if perr != nil || again != pod {
 				lost := &PinLostError{}
@@ -270,6 +297,7 @@ func (c *V0Client) Stream(ctx context.Context, userID, contextID, messageID, tex
 				return false
 			}
 			verified = true
+			c.sent.Store(messageID, pod.UID)
 			return true
 		}
 		for event, err := range client.SendStreamingMessage(ctx, &a2atype.SendMessageRequest{Message: message}) {
@@ -408,6 +436,18 @@ func (c *V0Client) bindPod(ctx context.Context, pod Pod) (*http.Client, error) {
 	return client, nil
 }
 
+// waitCtx waits d, or reports false once ctx ends first.
+func waitCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 // pinnedPod returns the Agent's only pod if it runs the pinned config and
 // image. The session read before a dispatch checks them too, but a rollout
 // can finish in between, so the pod actually addressed is checked again.
@@ -417,7 +457,7 @@ func (c *V0Client) pinnedPod(ctx context.Context) (Pod, error) {
 		return Pod{}, err
 	}
 	if pod.ConfigHash != c.hash || pod.ImageDigest != c.image {
-		return Pod{}, errors.New("the Agent pod runs another config or image")
+		return Pod{}, errPinChanged
 	}
 	return pod, nil
 }

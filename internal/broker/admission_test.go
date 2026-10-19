@@ -467,6 +467,77 @@ func TestV0TurnEndsWhenItsPodIsGone(t *testing.T) {
 	}
 }
 
+// The turn waits on the exact pod the send was confirmed on, so a pod
+// deleted right after that confirmation still ends the turn.
+func TestV0TurnEndsWhenItsPodIsGoneRightAfterTheSend(t *testing.T) {
+	remote := newFakeRemote()
+	remote.v0 = true
+	remote.setPods("pod-a")
+	remote.onBind = func() { remote.setPods() }
+	remote.streams = append(remote.streams, func(_ context.Context, contextID, messageID string) []item {
+		task := &a2atype.Task{ID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking}}
+		remote.setTask(task, messageID)
+		return []item{{event: task}, {err: errors.New("connection reset by peer")}}
+	})
+	h := newHarness(t, remote)
+	h.kagentV0 = true
+	h.restart()
+	o, p := testOwner(1), h.prompt("prompt-1")
+	done := make(chan string, 1)
+	go func() { done <- h.turn(o, p).Body.String() }()
+	eventually(t, "the wait", func() bool { return remote.count("get-task task-1") > 0 })
+	h.advance(podCheckEvery + time.Second)
+	select {
+	case body := <-done:
+		if !strings.Contains(body, failUnknown) {
+			t.Fatalf("turn whose pod is gone = %s", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the turn kept waiting after its pod was gone")
+	}
+}
+
+// A pod listing that fails proves nothing, so the next check tries again.
+func TestV0TurnKeepsCheckingItsPodAfterAFailedListing(t *testing.T) {
+	remote := newFakeRemote()
+	remote.v0 = true
+	remote.setPods("pod-a")
+	remote.podErrs = []error{errors.New("the server is currently unable to handle the request")}
+	remote.streams = append(remote.streams, func(_ context.Context, contextID, messageID string) []item {
+		task := &a2atype.Task{ID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking}}
+		remote.setTask(task, messageID)
+		return []item{{event: task}, {err: errors.New("connection reset by peer")}}
+	})
+	h := newHarness(t, remote)
+	h.kagentV0 = true
+	h.restart()
+	o, p := testOwner(1), h.prompt("prompt-1")
+	done := make(chan string, 1)
+	go func() { done <- h.turn(o, p).Body.String() }()
+	eventually(t, "the wait", func() bool { return remote.count("get-task task-1") > 0 })
+	remote.setPods("pod-b")
+	h.advance(podCheckEvery + time.Second)
+	eventually(t, "the failed listing", func() bool {
+		remote.mu.Lock()
+		defer remote.mu.Unlock()
+		return len(remote.podErrs) == 0
+	})
+	select {
+	case body := <-done:
+		t.Fatalf("the turn ended on a failed listing: %s", body)
+	case <-time.After(2 * terminalPoll):
+	}
+	h.advance(podCheckEvery + time.Second)
+	select {
+	case body := <-done:
+		if !strings.Contains(body, failUnknown) {
+			t.Fatalf("turn whose pod is gone = %s", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a failed listing stopped the pod checks")
+	}
+}
+
 // The pod a turn waits on is the one the send was confirmed on: a pod
 // replaced just before the send leaves the turn running on its replacement.
 func TestV0TurnWaitsOnThePodThatServedTheSend(t *testing.T) {

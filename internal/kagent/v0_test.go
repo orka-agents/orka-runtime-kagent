@@ -536,6 +536,75 @@ func TestV0StreamEndsWhenThePinnedPodIsReplaced(t *testing.T) {
 	}
 }
 
+// The client names the pod it confirmed served a send while the send's
+// stream is open, so the broker can wait on that exact pod.
+func TestV0StreamNamesTheConfirmedPod(t *testing.T) {
+	client, _, _ := newV0PodTest(t)
+	var during []string
+	for _, err := range client.Stream(context.Background(), "orka-user", "ctx", "msg-1", "hello", "") {
+		if err != nil {
+			t.Fatalf("Stream = %v", err)
+		}
+		uid, _ := client.SendPod("msg-1")
+		during = append(during, uid)
+	}
+	if len(during) == 0 || during[0] != "pod-a" {
+		t.Fatalf("confirmed pod during the stream = %v, want pod-a", during)
+	}
+	if uid, ok := client.SendPod("msg-1"); ok {
+		t.Fatalf("confirmed pod after the stream = %q, want none", uid)
+	}
+}
+
+// flakyPin fails its next failures pod lookups, as a busy Kubernetes API
+// would, and otherwise reports the pinned pod.
+type flakyPin struct {
+	fixedPin
+	mu       sync.Mutex
+	failures int
+}
+
+func (p *flakyPin) Pod(ctx context.Context) (Pod, error) {
+	p.mu.Lock()
+	failing := p.failures > 0
+	if failing {
+		p.failures--
+	}
+	p.mu.Unlock()
+	if failing {
+		return Pod{}, errors.New("the server is currently unable to handle the request")
+	}
+	return p.fixedPin.Pod(ctx)
+}
+
+func (p *flakyPin) failNext(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.failures = n
+}
+
+// A pod lookup that fails while a send is checked proves nothing about the
+// pod, so it is retried; only a lookup that keeps failing for the whole check
+// loses the pin.
+func TestV0SendCheckRetriesAFailedPodLookup(t *testing.T) {
+	retry := pinCheckRetry
+	pinCheckRetry = time.Millisecond
+	t.Cleanup(func() { pinCheckRetry = retry })
+	client, _, pod := newV0PodTest(t)
+	pin := &flakyPin{fixedPin: client.pin.(fixedPin)}
+	client.pin = pin
+	pod.beforeReply = func() { pin.failNext(2) }
+	if events, err := streamEvents(client, ""); err != nil || len(events) != 2 {
+		t.Fatalf("Stream after two failed lookups = %d events, %v", len(events), err)
+	}
+	client.callTimeout = 50 * time.Millisecond
+	pod.beforeReply = func() { pin.failNext(1 << 30) }
+	var lost *PinLostError
+	if _, err := streamEvents(client, ""); !errors.As(err, &lost) || lost.TaskID != "task-1" {
+		t.Fatalf("Stream while lookups keep failing = %v, want a PinLostError for task-1", err)
+	}
+}
+
 func TestV0VersionMustBeVerifiedOrAccepted(t *testing.T) {
 	client, controller := newV0Test(t)
 	ctx := context.Background()

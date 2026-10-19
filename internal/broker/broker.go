@@ -56,6 +56,9 @@ const (
 // left running.
 type agentPods interface {
 	AgentPodUIDs(ctx context.Context) ([]string, error)
+	// SendPod names the pod confirmed to serve the send of messageID, while
+	// that send's stream is open.
+	SendPod(messageID string) (string, bool)
 }
 
 // remote is the kagent surface the broker depends on.

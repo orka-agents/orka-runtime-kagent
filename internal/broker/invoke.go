@@ -193,10 +193,8 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 	tools := newToolRelay(stream)
 	var taskID a2atype.TaskID
 	var state a2atype.TaskState
-	// sendPods are the kagent v0 Agent's pods once the client confirmed the
-	// pinned pod served the send: that pod was then the only one, so the list
-	// holds it unless it is already gone.
-	var sendPods []string
+	// sendPod is the kagent v0 pod the client confirmed served the send.
+	var sendPod string
 	// kagent v1 reports usage on artifacts, which several events may repeat.
 	countedArtifacts := map[a2atype.ArtifactID]bool{}
 	streamCtx, stopStream := context.WithCancel(b.ctx)
@@ -233,7 +231,7 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 					taskID = cmp.Or(taskID, lost.TaskID)
 					b.markUnbound(key, promptKey, sequence, string(taskID))
 				} else if !bound && errors.Is(err, kagent.ErrPinHeld) {
-					sendPods = b.agentPods(ctx)
+					sendPod = b.sendPod(messageID)
 					b.markSent(key, promptKey, sequence, "")
 				}
 				break
@@ -249,7 +247,7 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 			}
 			if id := event.TaskInfo().TaskID; !bound || (id != "" && taskID == "") {
 				if !bound {
-					sendPods = b.agentPods(ctx)
+					sendPod = b.sendPod(messageID)
 				}
 				bound, taskID = true, cmp.Or(taskID, id)
 				b.markSent(key, promptKey, sequence, string(id))
@@ -309,7 +307,7 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 		out.failure = failInputRequired
 		return out
 	}
-	task, err := b.awaitTerminal(ctx, s.UserID, taskID, sendPods)
+	task, err := b.awaitTerminal(ctx, s.UserID, taskID, sendPod)
 	if err != nil {
 		out.failure = failUnknown
 		return out
@@ -345,7 +343,7 @@ func waiting(state a2atype.TaskState) bool {
 // kagent v0 never finishes a task whose pod died: it stays working. Once
 // every pod that existed at the send is gone, nothing can run it, so the turn
 // ends and settlement cancels it.
-func (b *lifecycleBroker) awaitTerminal(ctx context.Context, userID string, taskID a2atype.TaskID, sendPods []string) (*a2atype.Task, error) {
+func (b *lifecycleBroker) awaitTerminal(ctx context.Context, userID string, taskID a2atype.TaskID, sendPod string) (*a2atype.Task, error) {
 	nextPodCheck := b.cfg.now().Add(podCheckEvery)
 	for {
 		task, err := b.remote.GetTask(ctx, userID, taskID)
@@ -355,9 +353,10 @@ func (b *lifecycleBroker) awaitTerminal(ctx context.Context, userID string, task
 		if err == nil && task != nil && waiting(task.Status.State) {
 			return nil, errRemote
 		}
-		if len(sendPods) != 0 && !b.cfg.now().Before(nextPodCheck) {
+		if sendPod != "" && !b.cfg.now().Before(nextPodCheck) {
 			nextPodCheck = b.cfg.now().Add(podCheckEvery)
-			if current, ok := b.agentPodsKnown(ctx); ok && !slices.ContainsFunc(sendPods, func(uid string) bool { return slices.Contains(current, uid) }) {
+			// A failed listing proves nothing; the next check tries again.
+			if current, ok := b.agentPodsKnown(ctx); ok && !slices.Contains(current, sendPod) {
 				return nil, errRemote
 			}
 		}
@@ -367,10 +366,15 @@ func (b *lifecycleBroker) awaitTerminal(ctx context.Context, userID string, task
 	}
 }
 
-// agentPods lists a kagent v0 Agent's pods, or nothing when they are unknown.
-func (b *lifecycleBroker) agentPods(ctx context.Context) []string {
-	current, _ := b.agentPodsKnown(ctx)
-	return current
+// sendPod names the kagent v0 pod confirmed to serve messageID's open send,
+// or nothing when it is unknown.
+func (b *lifecycleBroker) sendPod(messageID string) string {
+	pods, ok := b.remote.(agentPods)
+	if !b.cfg.kagentV0 || !ok {
+		return ""
+	}
+	uid, _ := pods.SendPod(messageID)
+	return uid
 }
 
 func (b *lifecycleBroker) agentPodsKnown(ctx context.Context) ([]string, bool) {
