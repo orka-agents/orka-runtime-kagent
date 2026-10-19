@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,9 @@ const (
 	notAcceptedRetry = 100 * time.Millisecond
 	notAcceptedLimit = 30 * time.Second
 	terminalPoll     = 500 * time.Millisecond
+	// podCheckEvery is how often a kagent v0 turn checks that the pod
+	// running it still exists.
+	podCheckEvery    = 5 * time.Second
 	waitingCancelMax = 30 * time.Second
 	// A cancelled turn keeps its send open this long so kagent can name the
 	// task it admitted; settlement then cancels that task by ID instead of
@@ -189,6 +193,7 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 	tools := newToolRelay(stream)
 	var taskID a2atype.TaskID
 	var state a2atype.TaskState
+	var sendPods []string
 	streamCtx, stopStream := context.WithCancel(b.ctx)
 	defer stopStream()
 	stopGrace := context.AfterFunc(ctx, func() { time.AfterFunc(b.cfg.cancelGrace, stopStream) })
@@ -209,6 +214,9 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 			out.failure = failUnknown
 			return out
 		}
+		// kagent v0 runs the turn in the pod that serves the send, the Agent's
+		// only pod; a v0 send needs that one pod.
+		sendPods = b.agentPods(ctx)
 		// kagent v0's client confirms the pinned pod served the send before it
 		// yields the first event, and marks an error it confirmed.
 		notAccepted, pinLost, bound := false, false, !b.cfg.kagentV0
@@ -289,7 +297,7 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 		out.failure = failInputRequired
 		return out
 	}
-	task, err := b.awaitTerminal(ctx, s.UserID, taskID)
+	task, err := b.awaitTerminal(ctx, s.UserID, taskID, sendPods)
 	if err != nil {
 		out.failure = failUnknown
 		return out
@@ -314,7 +322,12 @@ func waiting(state a2atype.TaskState) bool {
 
 // awaitTerminal reads committed task state until it is terminal. Gateway
 // stream completion is observed, not trusted, before reading the result.
-func (b *lifecycleBroker) awaitTerminal(ctx context.Context, userID string, taskID a2atype.TaskID) (*a2atype.Task, error) {
+//
+// kagent v0 never finishes a task whose pod died: it stays working. Once
+// every pod that existed at the send is gone, nothing can run it, so the turn
+// ends and settlement cancels it.
+func (b *lifecycleBroker) awaitTerminal(ctx context.Context, userID string, taskID a2atype.TaskID, sendPods []string) (*a2atype.Task, error) {
+	nextPodCheck := b.cfg.now().Add(podCheckEvery)
 	for {
 		task, err := b.remote.GetTask(ctx, userID, taskID)
 		if err == nil && task != nil && task.Status.State.Terminal() {
@@ -323,10 +336,31 @@ func (b *lifecycleBroker) awaitTerminal(ctx context.Context, userID string, task
 		if err == nil && task != nil && waiting(task.Status.State) {
 			return nil, errRemote
 		}
+		if len(sendPods) != 0 && !b.cfg.now().Before(nextPodCheck) {
+			nextPodCheck = b.cfg.now().Add(podCheckEvery)
+			if current, ok := b.agentPodsKnown(ctx); ok && !slices.ContainsFunc(sendPods, func(uid string) bool { return slices.Contains(current, uid) }) {
+				return nil, errRemote
+			}
+		}
 		if !sleepCtx(ctx, terminalPoll) {
 			return nil, ctx.Err()
 		}
 	}
+}
+
+// agentPods lists a kagent v0 Agent's pods, or nothing when they are unknown.
+func (b *lifecycleBroker) agentPods(ctx context.Context) []string {
+	current, _ := b.agentPodsKnown(ctx)
+	return current
+}
+
+func (b *lifecycleBroker) agentPodsKnown(ctx context.Context) ([]string, bool) {
+	pods, ok := b.remote.(agentPods)
+	if !b.cfg.kagentV0 || !ok {
+		return nil, false
+	}
+	current, err := pods.AgentPodUIDs(ctx)
+	return current, err == nil
 }
 
 // taskText joins the task's text artifacts, skipping tool activity. kagent

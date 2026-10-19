@@ -392,3 +392,44 @@ func TestConfirmedSendErrorSettlesOnTheRevokedToken(t *testing.T) {
 		t.Fatalf("the confirmed send did not settle: %v", remote.snapshotCalls())
 	}
 }
+
+// kagent v0 leaves a task working when its pod dies. Once the pod that ran
+// the turn is gone, the turn ends instead of waiting for its deadline, and
+// settlement cancels the task.
+func TestV0TurnEndsWhenItsPodIsGone(t *testing.T) {
+	remote := newFakeRemote()
+	remote.v0 = true
+	remote.setPods("pod-a")
+	started := make(chan struct{})
+	remote.streams = append(remote.streams, func(_ context.Context, contextID, messageID string) []item {
+		task := &a2atype.Task{ID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking}}
+		remote.setTask(task, messageID)
+		close(started)
+		return []item{{event: task}, {err: errors.New("connection reset by peer")}}
+	})
+	h := newHarness(t, remote)
+	h.kagentV0 = true
+	h.restart()
+	o, p := testOwner(1), h.prompt("prompt-1")
+	done := make(chan string, 1)
+	go func() { done <- h.turn(o, p).Body.String() }()
+	<-started
+	select {
+	case body := <-done:
+		t.Fatalf("the turn ended while its pod runs: %s", body)
+	case <-time.After(2 * terminalPoll):
+	}
+	remote.setPods("pod-b")
+	h.advance(podCheckEvery + time.Second)
+	select {
+	case body := <-done:
+		if !strings.Contains(body, failUnknown) {
+			t.Fatalf("turn whose pod is gone = %s", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the turn kept waiting after its pod was gone")
+	}
+	if !h.control(settlePath, o, p).SettlementProven || remote.count("cancel task-1") == 0 {
+		t.Fatalf("the abandoned task was not settled by a cancel: %v", remote.snapshotCalls())
+	}
+}
