@@ -210,6 +210,43 @@ func TestObservedTurnReportsKagentV1ArtifactUsage(t *testing.T) {
 	}
 }
 
+// kagent v0 reports each model call's usage on the status message the call
+// produced, which the task's history keeps. A stream that breaks before the
+// turn ends leaves the rest of the usage to the terminal task, and a call
+// both carried counts once.
+func TestBrokenV0StreamReportsUsageFromTheTaskHistory(t *testing.T) {
+	remote := newFakeRemote()
+	remote.v0 = true
+	remote.setPods("pod-a")
+	usage := func(prompt, candidates float64) map[string]any {
+		return map[string]any{"adk_usage_metadata": map[string]any{"promptTokenCount": prompt, "candidatesTokenCount": candidates}}
+	}
+	remote.streams = append(remote.streams, func(_ context.Context, contextID, messageID string) []item {
+		first := &a2atype.Message{ID: "call-1", Role: a2atype.MessageRoleAgent, Metadata: usage(10, 5), Parts: []*a2atype.Part{a2atype.NewTextPart("thinking")}}
+		second := &a2atype.Message{ID: "call-2", Role: a2atype.MessageRoleAgent, Metadata: usage(7, 3), Parts: []*a2atype.Part{a2atype.NewTextPart("ok")}}
+		remote.setTask(&a2atype.Task{ID: "task-1", ContextID: contextID,
+			Status:    a2atype.TaskStatus{State: a2atype.TaskStateCompleted},
+			History:   []*a2atype.Message{{ID: messageID, Role: a2atype.MessageRoleUser}, first, second},
+			Artifacts: []*a2atype.Artifact{{ID: "answer", Parts: []*a2atype.Part{a2atype.NewTextPart("ok")}}}}, messageID)
+		return []item{
+			{event: &a2atype.Task{ID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking}}},
+			{event: &a2atype.TaskStatusUpdateEvent{TaskID: "task-1", ContextID: contextID, Metadata: first.Metadata,
+				Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking, Message: first}}},
+			{err: errors.New("connection reset by peer")},
+		}
+	})
+	h := newHarness(t, remote)
+	h.kagentV0 = true
+	h.restart()
+	recorder := h.turn(testOwner(1), h.prompt("prompt-1"))
+	events := parseSSE(t, recorder.Body.String())
+	reported, _ := events[len(events)-1].data["response"].(map[string]any)["usage"].(map[string]any)
+	if reported["input_tokens"] != float64(17) || reported["output_tokens"] != float64(8) {
+		data, _ := json.Marshal(reported)
+		t.Fatalf("reported usage = %s, body = %s", data, recorder.Body.String())
+	}
+}
+
 // kagent v0 creates a session under the broker's ID. When every create is
 // refused, as after the Agent is deleted, retirement waits until no earlier
 // create can still commit, then deletes that ID and requires it gone.

@@ -50,6 +50,33 @@ func EventUsage(event a2atype.Event) (Usage, bool) {
 	return Usage{}, false
 }
 
+// MessageUsage returns the usage kagent v0 reports on the messages of task,
+// keyed by message ID: v0 records each model call's usage on the status
+// message the call produced, which the task's history keeps, so a caller that
+// missed stream events can read it there, counting each key once.
+func MessageUsage(task *a2atype.Task) map[string]Usage {
+	usage := map[string]Usage{}
+	if task == nil {
+		return usage
+	}
+	for _, message := range append(append([]*a2atype.Message(nil), task.History...), task.Status.Message) {
+		if message == nil || message.ID == "" {
+			continue
+		}
+		if partial, _ := message.Metadata["adk_partial"].(bool); partial {
+			continue
+		}
+		raw, ok := message.Metadata[v0UsageMetadataKey].(map[string]any)
+		if !ok {
+			continue
+		}
+		if parsed, ok := parseUsage(raw); ok {
+			usage[message.ID] = parsed
+		}
+	}
+	return usage
+}
+
 // ArtifactUsage returns the usage kagent v1 reports on the artifacts of
 // event, keyed by artifact ID: v1 records each model call's usage on the
 // artifact the call produced, which artifact updates and task snapshots may
