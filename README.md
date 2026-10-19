@@ -6,8 +6,8 @@ Orka adds what a shared platform needs around it: one way to send work, a
 fresh session for every conversation, approvals before sensitive tool calls,
 and an audit record of what happened.
 
-> **Status: experimental.** kagent v0.10.3 is supported. kagent v1 is
-> supported for one pinned prerelease build until kagent v1.0.0. See
+> **Status:** kagent v0.10.3 is supported. kagent v1 support is experimental
+> and pinned to one prerelease build until kagent v1.0.0. See
 > [Supported kagent versions](#supported-kagent-versions).
 
 ## New to kagent or Orka?
@@ -45,9 +45,9 @@ Most of what you have stays as it is:
   use them are refused. Use Orka approvals in [governed mode](#observed-or-governed)
   instead.
 - **Your install needs a few NetworkPolicies.** kagent ships without them,
-  and without them any pod could talk to an Orka-owned session directly. See
+  which leaves any pod free to drive an Orka-owned session directly. See
   [Prepare your kagent install](docs/kagent-install.md).
-- **kagent v0 Agents run on the Go runtime with one replica.**
+- **kagent v0 Agents must use the Go runtime and run one replica.**
 
 ## Observed or governed
 
