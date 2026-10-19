@@ -193,6 +193,9 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 	tools := newToolRelay(stream)
 	var taskID a2atype.TaskID
 	var state a2atype.TaskState
+	// sendPods are the kagent v0 Agent's pods once the client confirmed the
+	// pinned pod served the send: that pod was then the only one, so the list
+	// holds it unless it is already gone.
 	var sendPods []string
 	// kagent v1 reports usage on artifacts, which several events may repeat.
 	countedArtifacts := map[a2atype.ArtifactID]bool{}
@@ -216,9 +219,6 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 			out.failure = failUnknown
 			return out
 		}
-		// kagent v0 runs the turn in the pod that serves the send, the Agent's
-		// only pod; a v0 send needs that one pod.
-		sendPods = b.agentPods(ctx)
 		// kagent v0's client confirms the pinned pod served the send before it
 		// yields the first event, and marks an error it confirmed.
 		notAccepted, pinLost, bound := false, false, !b.cfg.kagentV0
@@ -233,6 +233,7 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 					taskID = cmp.Or(taskID, lost.TaskID)
 					b.markUnbound(key, promptKey, sequence, string(taskID))
 				} else if !bound && errors.Is(err, kagent.ErrPinHeld) {
+					sendPods = b.agentPods(ctx)
 					b.markSent(key, promptKey, sequence, "")
 				}
 				break
@@ -247,6 +248,9 @@ func (b *lifecycleBroker) runTurn(ctx context.Context, s *session, key, promptKe
 				}
 			}
 			if id := event.TaskInfo().TaskID; !bound || (id != "" && taskID == "") {
+				if !bound {
+					sendPods = b.agentPods(ctx)
+				}
 				bound, taskID = true, cmp.Or(taskID, id)
 				b.markSent(key, promptKey, sequence, string(id))
 			}

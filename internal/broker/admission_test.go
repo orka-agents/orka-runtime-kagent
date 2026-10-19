@@ -452,6 +452,7 @@ func TestV0TurnEndsWhenItsPodIsGone(t *testing.T) {
 	case <-time.After(2 * terminalPoll):
 	}
 	remote.setPods("pod-b")
+	eventually(t, "the wait", func() bool { return remote.count("get-task task-1") > 0 })
 	h.advance(podCheckEvery + time.Second)
 	select {
 	case body := <-done:
@@ -463,5 +464,49 @@ func TestV0TurnEndsWhenItsPodIsGone(t *testing.T) {
 	}
 	if !h.control(settlePath, o, p).SettlementProven || remote.count("cancel task-1") == 0 {
 		t.Fatalf("the abandoned task was not settled by a cancel: %v", remote.snapshotCalls())
+	}
+}
+
+// The pod a turn waits on is the one the send was confirmed on: a pod
+// replaced just before the send leaves the turn running on its replacement.
+func TestV0TurnWaitsOnThePodThatServedTheSend(t *testing.T) {
+	remote := newFakeRemote()
+	remote.v0 = true
+	remote.setPods("pod-a")
+	started := make(chan struct{})
+	remote.streams = append(remote.streams, func(_ context.Context, contextID, messageID string) []item {
+		// pod-b replaced pod-a before the send bound to it.
+		remote.setPods("pod-b")
+		task := &a2atype.Task{ID: "task-1", ContextID: contextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking}}
+		remote.setTask(task, messageID)
+		close(started)
+		return []item{{event: task}, {err: errors.New("connection reset by peer")}}
+	})
+	h := newHarness(t, remote)
+	h.kagentV0 = true
+	h.restart()
+	o, p := testOwner(1), h.prompt("prompt-1")
+	done := make(chan string, 1)
+	go func() { done <- h.turn(o, p).Body.String() }()
+	<-started
+	// Once the turn waits on the task, its pod check comes due.
+	eventually(t, "the wait", func() bool { return remote.count("get-task task-1") > 0 })
+	h.advance(podCheckEvery + time.Second)
+	select {
+	case body := <-done:
+		t.Fatalf("a turn running on its pod ended: %s", body)
+	case <-time.After(3 * terminalPoll):
+	}
+	remote.mu.Lock()
+	remote.tasks["task-1"].Status.State = a2atype.TaskStateCompleted
+	remote.tasks["task-1"].Artifacts = []*a2atype.Artifact{{ID: "answer", Parts: []*a2atype.Part{a2atype.NewTextPart("ok")}}}
+	remote.mu.Unlock()
+	select {
+	case body := <-done:
+		if strings.Contains(body, failUnknown) || !strings.Contains(body, "response.completed") {
+			t.Fatalf("turn on the replacement pod = %s", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the turn did not finish")
 	}
 }
