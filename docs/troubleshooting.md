@@ -30,11 +30,15 @@ then settles the prompt and retires the session normally.
 
 The broker logs the same `kagent session quarantined` line. Deleting the
 session does not resolve a v0 quarantine, because it does not stop a running
-turn:
+turn. What does depends on whether the broker tied the send to its pod:
 
-1. If the logged tasks are still running, cancel them with A2A `CancelTask`
-   as the logged user.
-2. If the Agent's pod has restarted since, its executions are gone, and the
-   broker's next cancel settles the task.
-3. An observed send that left no task settles once the Agent's pods that
-   existed at the fence are gone; restart the Agent's Deployment.
+1. **A send confirmed on its pod.** If the logged tasks are still running,
+   cancel them with A2A `CancelTask` as the logged user. If the Agent's pod
+   has restarted since, its executions are gone, and the broker's next cancel
+   settles the task.
+2. **Any other send**, governed or observed, and whether or not it names a
+   task: one the broker never confirmed, one whose pod changed during it, and
+   one that left no task. Which pod runs it is unknown, so neither a cancel
+   nor the task's state proves anything: it settles only once every Agent pod
+   that existed at its fence is gone. Restart the Agent's Deployment, and let
+   the pods terminate gracefully; never force-delete them.

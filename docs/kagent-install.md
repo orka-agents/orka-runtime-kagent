@@ -151,6 +151,10 @@ the import checks the image's name, and the pin keeps that exact image.
 
   Label each wrapper pod `orka.ai/kagent-broker: "true"`. Turn off kagent's
   UI or keep it off this network: it calls the controller as any user.
+
+  These policies trust any pod in the Orka namespace that carries that
+  label, so only operators may create or label pods there, as for every
+  other Orka component in it.
 - **Code in Agent pods.** The controller policy cannot narrow what Agent pods
   call. kagent v0 points every Agent at the controller Service itself, so
   unlike v1's `controlPlaneUrl` there is no place for a filtering proxy, and
