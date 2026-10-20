@@ -11,8 +11,10 @@ on:
 permissions:
   contents: read
 
+# One group per commit and ref: a group keeps only one pending run, which
+# would drop another commit's image.
 concurrency:
-  group: publish-${{ github.ref }}
+  group: publish-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
