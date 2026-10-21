@@ -1,0 +1,38 @@
+version: "2"
+run:
+  allow-parallel-runners: true
+linters:
+  default: none
+  enable:
+    - copyloopvar
+    - errcheck
+    - govet
+    - ineffassign
+    - modernize
+    - misspell
+    - staticcheck
+    - unused
+  settings:
+    modernize:
+      disable:
+        - omitzero
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+      # Byte-for-byte copies of orka-runtime-foundry, checked by
+      # hack/check-copied-code.sh. Fix lint findings there, then re-copy.
+      - internal/durablestore
+      - internal/strictjson
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
